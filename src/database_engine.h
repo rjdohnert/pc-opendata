@@ -342,6 +342,11 @@ bool validate_user_config(void);
 void log_error_report(const char* format, ...);
 void log_error_report_event(const char* event);
 void audit_log_statement(const char* command, const char* detail, bool success);
+bool verify_audit_log(const char* path, char* error_out, size_t error_cap);
+bool execute_verify_audit_log(void);
+extern char g_tde_key[65];
+extern bool g_tde_enabled;
+bool opendata_set_tde_key(const char* key_hex);
 
 bool acquire_database_file_lock(void);
 bool allocate_table_storage(Table* table, int capacity);
@@ -492,6 +497,7 @@ bool wal_write_page_delta(uint32_t page_id, uint16_t offset, const void* data, u
 bool wal_commit_tx(uint32_t tx_id);
 bool wal_checkpoint_now(BufferPool* bp, int db_fd);
 bool wal_recover_and_replay(int db_fd, BufferPool* bp);
+bool wal_recover_and_replay_to_timestamp(int db_fd, BufferPool* bp, uint32_t target_timestamp);
 void wal_shutdown(void);
 
 /* Phase 4: Persistent On-Disk B+ Tree Index */
@@ -609,6 +615,9 @@ bool cluster_init(const ClusterConfig* config);
 bool raft_ship_wal_sync(const void* data, size_t len);
 void cluster_shutdown(void);
 void print_cluster_status(void);
+uint32_t raft_get_current_term(void);
+bool raft_add_peer(const char* peer_addr);
+bool raft_remove_peer(int node_id);
 ClusterTlsContext* cluster_tls_create(const char* cert_path, const char* key_path,
                                       const char* ca_path, int local_node_id);
 void cluster_tls_destroy(ClusterTlsContext* context);
@@ -719,6 +728,7 @@ void update_client_session_query(int session_id, const char* state, const char* 
 bool is_client_session_killed(int session_id);
 void print_active_sessions(void);
 bool kill_client_session(int session_id);
+int get_active_session_count(void);
 
 /* Phase 4: Native VECTOR(dim) SIMD Distance Functions */
 int parse_vector_floats(const char* text, float* out_vals, int max_dim);

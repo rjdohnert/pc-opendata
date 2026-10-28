@@ -104,7 +104,7 @@ static const char* suggest_command_word(const char* word) {
         "DISCONNECT", "EXIT", "QUIT", "BACKUP", "RESTART", "CHECK", "VACUUM",
         "COMPACT", "DUMP", "DIFF", "BENCHMARK", "WATCH", "HISTORY", "SPOOL",
         "SOURCE", "SET", "CLEAR", "CLS", "CANCEL", "PING", "LOAD", "SUPPORT",
-        "CONNECTION", "KILL", "IRIS", "EDIT"
+        "CONNECTION", "KILL", "IRIS", "EDIT", "VERIFY"
     };
     return suggest_word(word, commands, sizeof(commands) / sizeof(commands[0]));
 }
@@ -112,7 +112,7 @@ static const char* suggest_command_word(const char* word) {
 static const char* suggest_show_word(const char* word) {
     static const char* const targets[] = {
         "TABLES", "DATABASES", "USERS", "USER", "SESSIONS", "PROCESSLIST",
-        "SCHEMA", "CLUSTER", "ENGINE", "CREATE", "STATS", "CONSTRAINTS"
+        "SCHEMA", "CLUSTER", "ENGINE", "CREATE", "STATS", "CONSTRAINTS", "METRICS"
     };
     return suggest_word(word, targets, sizeof(targets) / sizeof(targets[0]));
 }
@@ -1688,6 +1688,26 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
     } else if (!strcmp(command, "SHOW") && consume_keyword(&p, "CLUSTER")) {
         ok = consume_statement_end(&p);
         if (ok) print_cluster_status();
+    } else if (!strcmp(command, "SHOW") && consume_keyword(&p, "METRICS")) {
+        ok = consume_statement_end(&p);
+        if (ok) {
+            AuthRateLimitStats arl_stats = auth_rate_limit_stats();
+            shell_puts("METRIC\tVALUE");
+            shell_puts("opendata_up\t1");
+            shell_printf("opendata_active_sessions\t%d\n", get_active_session_count());
+            shell_printf("opendata_database_tables\t%d\n", g_committed ? g_committed->table_count : 0);
+            shell_printf("opendata_database_generation\t%llu\n", (unsigned long long)g_generation);
+            shell_printf("opendata_raft_role\t%s (%d)\n",
+                         g_raft_role == RAFT_LEADER ? "LEADER" : (g_raft_role == RAFT_CANDIDATE ? "CANDIDATE" : "FOLLOWER"),
+                         (int)g_raft_role);
+            shell_printf("opendata_raft_term\t%u\n", raft_get_current_term());
+            shell_printf("opendata_auth_admitted_total\t%llu\n", (unsigned long long)arl_stats.admitted);
+            shell_printf("opendata_auth_failures_total\t%llu\n", (unsigned long long)arl_stats.credential_failures);
+            shell_printf("opendata_auth_throttled_total\t%llu\n",
+                         (unsigned long long)(arl_stats.source_throttled + arl_stats.pair_throttled + arl_stats.global_throttled));
+        }
+    } else if (!strcmp(command, "VERIFY") && (consume_keyword(&p, "AUDIT") || consume_keyword(&p, "AUDIT_LOG"))) {
+        ok = consume_statement_end(&p) && execute_verify_audit_log();
     } else if (!strcmp(command, "DROP") && consume_keyword(&p, "DATABASE")) {
         ok = execute_drop_database_statement(&p);
     } else if (!g_db) {

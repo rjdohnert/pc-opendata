@@ -2,9 +2,11 @@
 
 #ifdef _WIN32
 #include <shlobj.h>
+#include <bcrypt.h>
 #else
 #include <pwd.h>
 #include <sys/types.h>
+#include <openssl/sha.h>
 #endif
 
 char g_config_path[PATH_CAP];
@@ -325,20 +327,74 @@ bool validate_user_config(void) {
     return true;
 }
 
+static void format_digest_alpha(const unsigned char digest[32], char out[65]) {
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = (char)('a' + ((digest[i] >> 4) & 0x0F));
+        out[i * 2 + 1] = (char)('a' + (digest[i] & 0x0F));
+    }
+    out[64] = '\0';
+}
+
+static bool compute_audit_sha256(const void* data, size_t len, char hex_out[65]) {
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) < 0) return false;
+    bool ok = false;
+    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) >= 0) {
+        if (BCryptHashData(hash, (PUCHAR)data, (ULONG)len, 0) >= 0) {
+            unsigned char digest[32];
+            if (BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0) {
+                format_digest_alpha(digest, hex_out);
+                ok = true;
+            }
+        }
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+#else
+    unsigned char digest[32];
+    SHA256((const unsigned char*)data, len, digest);
+    format_digest_alpha(digest, hex_out);
+    return true;
+#endif
+}
+
+static bool get_audit_path(char* path, size_t cap) {
+    if (g_audit_log_path[0]) {
+        snprintf(path, cap, "%s", g_audit_log_path);
+        return true;
+    }
+    if (!g_error_report_path[0]) build_config_paths();
+    if (!g_error_report_path[0]) return false;
+    snprintf(path, cap, "%s", g_error_report_path);
+    char* sep = strrchr(path, PATH_SEPARATOR[0]);
+    if (!sep) return false;
+    snprintf(sep + 1, cap - (size_t)(sep + 1 - path), ".opendata_audit");
+    return true;
+}
+
 void audit_log_statement(const char* command, const char* detail, bool success) {
     if (!g_audit_log_enabled) return;
     char path[PATH_CAP];
-    if (g_audit_log_path[0]) {
-        snprintf(path, sizeof(path), "%s", g_audit_log_path);
-    } else {
-        if (!g_error_report_path[0]) build_config_paths();
-        if (!g_error_report_path[0]) return;
-        /* Derive the default from the error-report path's directory. */
-        snprintf(path, sizeof(path), "%s", g_error_report_path);
-        char* sep = strrchr(path, PATH_SEPARATOR[0]);
-        if (!sep) return;
-        snprintf(sep + 1, sizeof(path) - (size_t)(sep + 1 - path), ".opendata_audit");
+    if (!get_audit_path(path, sizeof(path))) return;
+
+    char prev_hash[65] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /* Read the last line to obtain the chained previous hash */
+    FILE* in = fopen(path, "r");
+    if (in) {
+        char line[1024];
+        while (fgets(line, sizeof(line), in)) {
+            const char* hp = strstr(line, " hash=");
+            if (hp && strlen(hp + 6) >= 64) {
+                memcpy(prev_hash, hp + 6, 64);
+                prev_hash[64] = '\0';
+            }
+        }
+        fclose(in);
     }
+
     FILE* out = fopen(path, "a");
     if (!out) return;
     time_t now = time(NULL);
@@ -352,10 +408,93 @@ void audit_log_statement(const char* command, const char* detail, bool success) 
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
     const char* actor = g_network_user[0] ? g_network_user :
                         (g_interactive_shell ? "local-shell" : "local-process");
-    fprintf(out, "[%s] actor=%s command=%s target=%s result=%s\n",
-            timestamp, actor, command,
-            detail && detail[0] ? detail : "-", success ? "OK" : "FAILED");
+
+    char record[1024];
+    snprintf(record, sizeof(record), "[%s] actor=%s command=%s target=%s result=%s prev_hash=%s",
+             timestamp, actor, command,
+             detail && detail[0] ? detail : "-", success ? "OK" : "FAILED", prev_hash);
+    char current_hash[65] = {0};
+    compute_audit_sha256(record, strlen(record), current_hash);
+
+    fprintf(out, "%s hash=%s\n", record, current_hash);
     fclose(out);
+}
+
+bool verify_audit_log(const char* path, char* error_out, size_t error_cap) {
+    if (!path || !path[0]) {
+        snprintf(error_out, error_cap, "invalid audit log path");
+        return false;
+    }
+    FILE* file = fopen(path, "r");
+    if (!file) {
+        snprintf(error_out, error_cap, "cannot open audit log file: %s", path);
+        return false;
+    }
+    char expected_prev[65] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    char line[1024];
+    int line_num = 0;
+    while (fgets(line, sizeof(line), file)) {
+        line_num++;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) line[--len] = '\0';
+        if (len == 0) continue;
+
+        const char* prev_ptr = strstr(line, " prev_hash=");
+        const char* hash_ptr = strstr(line, " hash=");
+        if (!prev_ptr || !hash_ptr || hash_ptr <= prev_ptr) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: missing cryptographic hash chaining metadata", line_num);
+            return false;
+        }
+
+        char rec_prev[65] = {0};
+        char rec_hash[65] = {0};
+        if (strlen(prev_ptr + 11) < 64 || strlen(hash_ptr + 6) < 64) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: truncated hash metadata", line_num);
+            return false;
+        }
+        memcpy(rec_prev, prev_ptr + 11, 64);
+        memcpy(rec_hash, hash_ptr + 6, 64);
+
+        if (strcmp(rec_prev, expected_prev) != 0) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: hash chain broken (expected prev_hash %s, found %s)",
+                     line_num, expected_prev, rec_prev);
+            return false;
+        }
+
+        size_t prefix_len = (size_t)(hash_ptr - line);
+        char computed_hash[65] = {0};
+        compute_audit_sha256(line, prefix_len, computed_hash);
+        if (strcmp(computed_hash, rec_hash) != 0) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: entry content tampered (computed %s, recorded %s)",
+                     line_num, computed_hash, rec_hash);
+            return false;
+        }
+
+        memcpy(expected_prev, rec_hash, 65);
+    }
+    fclose(file);
+    if (line_num == 0) snprintf(error_out, error_cap, "audit log is empty");
+    else snprintf(error_out, error_cap, "verified %d audit entries; cryptographic hash chain intact", line_num);
+    return true;
+}
+
+bool execute_verify_audit_log(void) {
+    char path[PATH_CAP];
+    if (!get_audit_path(path, sizeof(path))) {
+        return report_database_error("cannot determine audit log path");
+    }
+    char msg[256];
+    bool ok = verify_audit_log(path, msg, sizeof(msg));
+    if (ok) {
+        printf("AUDIT VERIFICATION: OK (%s)\n", msg);
+    } else {
+        report_database_error("AUDIT VERIFICATION FAILED: %s", msg);
+    }
+    return ok;
 }
 
 void log_error_report(const char* format, ...) {

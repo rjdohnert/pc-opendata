@@ -344,6 +344,11 @@ bool validate_user_config(void);
 void log_error_report(const char* format, ...);
 void log_error_report_event(const char* event);
 void audit_log_statement(const char* command, const char* detail, bool success);
+bool verify_audit_log(const char* path, char* error_out, size_t error_cap);
+bool execute_verify_audit_log(void);
+extern char g_tde_key[65];
+extern bool g_tde_enabled;
+bool opendata_set_tde_key(const char* key_hex);
 
 bool acquire_database_file_lock(void);
 bool allocate_table_storage(Table* table, int capacity);
@@ -494,6 +499,7 @@ bool wal_write_page_delta(uint32_t page_id, uint16_t offset, const void* data, u
 bool wal_commit_tx(uint32_t tx_id);
 bool wal_checkpoint_now(BufferPool* bp, int db_fd);
 bool wal_recover_and_replay(int db_fd, BufferPool* bp);
+bool wal_recover_and_replay_to_timestamp(int db_fd, BufferPool* bp, uint32_t target_timestamp);
 void wal_shutdown(void);
 
 /* Phase 4: Persistent On-Disk B+ Tree Index */
@@ -611,6 +617,9 @@ bool cluster_init(const ClusterConfig* config);
 bool raft_ship_wal_sync(const void* data, size_t len);
 void cluster_shutdown(void);
 void print_cluster_status(void);
+uint32_t raft_get_current_term(void);
+bool raft_add_peer(const char* peer_addr);
+bool raft_remove_peer(int node_id);
 ClusterTlsContext* cluster_tls_create(const char* cert_path, const char* key_path,
                                       const char* ca_path, int local_node_id);
 void cluster_tls_destroy(ClusterTlsContext* context);
@@ -721,6 +730,7 @@ void update_client_session_query(int session_id, const char* state, const char* 
 bool is_client_session_killed(int session_id);
 void print_active_sessions(void);
 bool kill_client_session(int session_id);
+int get_active_session_count(void);
 
 /* Phase 4: Native VECTOR(dim) SIMD Distance Functions */
 int parse_vector_floats(const char* text, float* out_vals, int max_dim);
@@ -760,6 +770,23 @@ char g_path[PATH_CAP], g_backup_dir[PATH_CAP];
 char g_network_user[MAX_NAME_LEN];
 bool g_network_tls_active;
 char g_last_error[MAX_VAL_LEN];
+char g_tde_key[65] = {0};
+bool g_tde_enabled = false;
+
+bool opendata_set_tde_key(const char* key_hex) {
+    if (!key_hex || !*key_hex) {
+        g_tde_enabled = false;
+        memset(g_tde_key, 0, sizeof(g_tde_key));
+        return true;
+    }
+    size_t len = strlen(key_hex);
+    if (len != 32 && len != 64) {
+        return report_database_error("TDE key must be 32 or 64 hex characters (128-bit or 256-bit)");
+    }
+    snprintf(g_tde_key, sizeof(g_tde_key), "%s", key_hex);
+    g_tde_enabled = true;
+    return true;
+}
 unsigned g_backup_interval = 60;
 atomic_bool g_stop, g_backup_failed;
 atomic_bool g_restart_requested;
@@ -1871,6 +1898,7 @@ bool wal_write_page_delta(uint32_t page_id, uint16_t offset, const void* data, u
     hdr.length = len;
     hdr.page_id = page_id;
     hdr.page_offset = offset;
+    hdr.reserved = (uint32_t)time(NULL);
     hdr.crc32 = wal_record_crc32(&hdr, data, len);
 
     if (fwrite(&hdr, sizeof(hdr), 1, g_wal_file) != 1) return false;
@@ -1887,6 +1915,7 @@ bool wal_commit_tx(uint32_t tx_id) {
     hdr.tx_id = tx_id;
     hdr.op = WAL_OP_COMMIT;
     hdr.length = 0;
+    hdr.reserved = (uint32_t)time(NULL);
     hdr.crc32 = 0;
 
     if (fwrite(&hdr, sizeof(hdr), 1, g_wal_file) != 1) return false;
@@ -1915,7 +1944,7 @@ bool wal_checkpoint_now(BufferPool* bp, int db_fd) {
     return g_wal_file != NULL;
 }
 
-bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
+bool wal_recover_and_replay_to_timestamp(int db_fd, BufferPool* bp, uint32_t target_timestamp) {
     if (!g_wal_path[0] || db_fd < 0) return false;
     FILE* file = NULL;
 #ifdef _WIN32
@@ -1931,6 +1960,10 @@ bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
     while (fread(&hdr, sizeof(hdr), 1, file) == 1) {
         if (hdr.magic != WAL_MAGIC) { ok = false; break; }
         if (hdr.length > PAGE_SIZE) { ok = false; break; }
+        if (target_timestamp > 0 && hdr.reserved > target_timestamp) {
+            /* Point-in-time recovery limit reached */
+            break;
+        }
         if (hdr.length > 0) {
             if (fread(buffer, 1, hdr.length, file) != hdr.length) { ok = false; break; }
             if (wal_record_crc32(&hdr, buffer, hdr.length) != hdr.crc32) { ok = false; break; }
@@ -1949,6 +1982,10 @@ bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
     fclose(file);
     if (ok) buffer_pool_flush_all(bp, db_fd);
     return ok;
+}
+
+bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
+    return wal_recover_and_replay_to_timestamp(db_fd, bp, 0);
 }
 
 void wal_shutdown(void) {
@@ -7806,6 +7843,161 @@ bool execute_import_statement(Parser* p) {
 #line 1 "snapshot_format.c"
 
 
+#ifdef _WIN32
+#include <bcrypt.h>
+#else
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#endif
+
+static bool derive_tde_raw_key(unsigned char key_bytes[32]) {
+    if (!g_tde_enabled || !g_tde_key[0]) return false;
+    size_t len = strlen(g_tde_key);
+    if (len == 64) {
+        for (int i = 0; i < 32; i++) {
+            unsigned int byte_val = 0;
+            if (sscanf(g_tde_key + i * 2, "%02x", &byte_val) != 1) return false;
+            key_bytes[i] = (unsigned char)byte_val;
+        }
+        return true;
+    }
+    memset(key_bytes, 0, 32);
+    memcpy(key_bytes, g_tde_key, len < 32 ? len : 32);
+    return true;
+}
+
+static bool tde_encrypt_image(Image* image) {
+    unsigned char key_bytes[32];
+    if (!derive_tde_raw_key(key_bytes)) return false;
+    unsigned char iv[16];
+#ifdef _WIN32
+    if (BCryptGenRandom(NULL, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return false;
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_KEY_HANDLE key_h = NULL;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) return false;
+    if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0) < 0) {
+        BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    if (BCryptGenerateSymmetricKey(alg, &key_h, NULL, 0, key_bytes, 32, 0) < 0) {
+        BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    ULONG cipher_len = 0;
+    unsigned char iv_copy[16];
+    memcpy(iv_copy, iv, 16);
+    if (BCryptEncrypt(key_h, image->data, (ULONG)image->size, NULL, iv_copy, 16, NULL, 0, &cipher_len, BCRYPT_BLOCK_PADDING) < 0) {
+        BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    size_t total_enc_size = 8 + 16 + 4 + cipher_len;
+    unsigned char* enc_data = malloc(total_enc_size);
+    if (!enc_data) { BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false; }
+    memcpy(enc_data, "PCODEN01", 8);
+    memcpy(enc_data + 8, iv, 16);
+    uint32_t orig_sz = (uint32_t)image->size;
+    enc_data[24] = (unsigned char)(orig_sz);
+    enc_data[25] = (unsigned char)(orig_sz >> 8);
+    enc_data[26] = (unsigned char)(orig_sz >> 16);
+    enc_data[27] = (unsigned char)(orig_sz >> 24);
+    memcpy(iv_copy, iv, 16);
+    ULONG written = 0;
+    if (BCryptEncrypt(key_h, image->data, (ULONG)image->size, NULL, iv_copy, 16, enc_data + 28, cipher_len, &written, BCRYPT_BLOCK_PADDING) < 0) {
+        free(enc_data); BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    BCryptDestroyKey(key_h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    free(image->data);
+    image->data = enc_data;
+    image->size = image->capacity = total_enc_size;
+    return true;
+#else
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    RAND_bytes(iv, sizeof(iv));
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key_bytes, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx); return false;
+    }
+    size_t total_enc_size = 8 + 16 + 4 + image->size + 32;
+    unsigned char* enc_data = malloc(total_enc_size);
+    if (!enc_data) { EVP_CIPHER_CTX_free(ctx); return false; }
+    memcpy(enc_data, "PCODEN01", 8);
+    memcpy(enc_data + 8, iv, 16);
+    uint32_t orig_sz = (uint32_t)image->size;
+    enc_data[24] = (unsigned char)(orig_sz);
+    enc_data[25] = (unsigned char)(orig_sz >> 8);
+    enc_data[26] = (unsigned char)(orig_sz >> 16);
+    enc_data[27] = (unsigned char)(orig_sz >> 24);
+    int outlen = 0;
+    EVP_EncryptUpdate(ctx, enc_data + 28, &outlen, image->data, (int)image->size);
+    int total_cipher = outlen;
+    EVP_EncryptFinal_ex(ctx, enc_data + 28 + total_cipher, &outlen);
+    total_cipher += outlen;
+    EVP_CIPHER_CTX_free(ctx);
+    free(image->data);
+    image->data = enc_data;
+    image->size = image->capacity = 28 + (size_t)total_cipher;
+    return true;
+#endif
+}
+
+static bool tde_decrypt_image(Image* image) {
+    if (!image || image->size < 28 || memcmp(image->data, "PCODEN01", 8) != 0) return false;
+    unsigned char key_bytes[32];
+    if (!derive_tde_raw_key(key_bytes)) {
+        report_database_error("database is encrypted with TDE: encryption key required");
+        return false;
+    }
+    unsigned char iv[16];
+    memcpy(iv, image->data + 8, 16);
+    uint32_t orig_sz = (uint32_t)image->data[24] | ((uint32_t)image->data[25] << 8) |
+                       ((uint32_t)image->data[26] << 16) | ((uint32_t)image->data[27] << 24);
+    if (orig_sz > MAX_IMAGE) return false;
+    const unsigned char* cipher = image->data + 28;
+    size_t cipher_len = image->size - 28;
+    unsigned char* plain = malloc((size_t)orig_sz + 64);
+    if (!plain) return false;
+
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_KEY_HANDLE key_h = NULL;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) { free(plain); return false; }
+    if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0) < 0) {
+        free(plain); BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    if (BCryptGenerateSymmetricKey(alg, &key_h, NULL, 0, key_bytes, 32, 0) < 0) {
+        free(plain); BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
+    ULONG plain_len = 0;
+    unsigned char iv_copy[16];
+    memcpy(iv_copy, iv, 16);
+    if (BCryptDecrypt(key_h, (PUCHAR)cipher, (ULONG)cipher_len, NULL, iv_copy, 16, plain, orig_sz + 64, &plain_len, BCRYPT_BLOCK_PADDING) < 0) {
+        free(plain); BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0);
+        report_database_error("TDE decryption failed: invalid encryption key");
+        return false;
+    }
+    BCryptDestroyKey(key_h);
+    BCryptCloseAlgorithmProvider(alg, 0);
+#else
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) { free(plain); return false; }
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key_bytes, iv) != 1) {
+        free(plain); EVP_CIPHER_CTX_free(ctx); return false;
+    }
+    int outlen = 0;
+    EVP_DecryptUpdate(ctx, plain, &outlen, cipher, (int)cipher_len);
+    int total_plain = outlen;
+    if (EVP_DecryptFinal_ex(ctx, plain + total_plain, &outlen) != 1) {
+        free(plain); EVP_CIPHER_CTX_free(ctx);
+        report_database_error("TDE decryption failed: invalid encryption key");
+        return false;
+    }
+    total_plain += outlen;
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    free(image->data);
+    image->data = plain;
+    image->size = image->capacity = (size_t)orig_sz;
+    return true;
+}
+
 static bool has_extension_ci(const char* path, const char* ext) {
     if (!path || !ext) return false;
     size_t plen = strlen(path);
@@ -7959,10 +8151,15 @@ bool encode_database_snapshot(const Database* db, uint64_t identity, uint64_t ge
         }
     }
     if (image->ok) encode_u32(image, calculate_crc32(image->data, image->size));
+    if (image->ok && g_tde_enabled) tde_encrypt_image(image);
     return image->ok;
 }
 
 Database* decode_database_snapshot(Image* image, uint64_t* identity, uint64_t* generation) {
+    if (image->size < 28) return NULL;
+    if (image->size >= 28 && memcmp(image->data, "PCODEN01", 8) == 0) {
+        if (!tde_decrypt_image(image)) return NULL;
+    }
     if (image->size < 32) return NULL;
     if (memcmp(image->data, "PCOD0001", 8) != 0 &&
         memcmp(image->data, "MSQLMDF1", 8) != 0 &&
@@ -10045,9 +10242,11 @@ intptr_t hotpatch_adopt_listener(int port, const char* bind_addr) {
 
 #ifdef _WIN32
 #include <shlobj.h>
+#include <bcrypt.h>
 #else
 #include <pwd.h>
 #include <sys/types.h>
+#include <openssl/sha.h>
 #endif
 
 char g_config_path[PATH_CAP];
@@ -10368,20 +10567,74 @@ bool validate_user_config(void) {
     return true;
 }
 
+static void format_digest_alpha(const unsigned char digest[32], char out[65]) {
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = (char)('a' + ((digest[i] >> 4) & 0x0F));
+        out[i * 2 + 1] = (char)('a' + (digest[i] & 0x0F));
+    }
+    out[64] = '\0';
+}
+
+static bool compute_audit_sha256(const void* data, size_t len, char hex_out[65]) {
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) < 0) return false;
+    bool ok = false;
+    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) >= 0) {
+        if (BCryptHashData(hash, (PUCHAR)data, (ULONG)len, 0) >= 0) {
+            unsigned char digest[32];
+            if (BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0) {
+                format_digest_alpha(digest, hex_out);
+                ok = true;
+            }
+        }
+        BCryptDestroyHash(hash);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+#else
+    unsigned char digest[32];
+    SHA256((const unsigned char*)data, len, digest);
+    format_digest_alpha(digest, hex_out);
+    return true;
+#endif
+}
+
+static bool get_audit_path(char* path, size_t cap) {
+    if (g_audit_log_path[0]) {
+        snprintf(path, cap, "%s", g_audit_log_path);
+        return true;
+    }
+    if (!g_error_report_path[0]) build_config_paths();
+    if (!g_error_report_path[0]) return false;
+    snprintf(path, cap, "%s", g_error_report_path);
+    char* sep = strrchr(path, PATH_SEPARATOR[0]);
+    if (!sep) return false;
+    snprintf(sep + 1, cap - (size_t)(sep + 1 - path), ".opendata_audit");
+    return true;
+}
+
 void audit_log_statement(const char* command, const char* detail, bool success) {
     if (!g_audit_log_enabled) return;
     char path[PATH_CAP];
-    if (g_audit_log_path[0]) {
-        snprintf(path, sizeof(path), "%s", g_audit_log_path);
-    } else {
-        if (!g_error_report_path[0]) build_config_paths();
-        if (!g_error_report_path[0]) return;
-        /* Derive the default from the error-report path's directory. */
-        snprintf(path, sizeof(path), "%s", g_error_report_path);
-        char* sep = strrchr(path, PATH_SEPARATOR[0]);
-        if (!sep) return;
-        snprintf(sep + 1, sizeof(path) - (size_t)(sep + 1 - path), ".opendata_audit");
+    if (!get_audit_path(path, sizeof(path))) return;
+
+    char prev_hash[65] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /* Read the last line to obtain the chained previous hash */
+    FILE* in = fopen(path, "r");
+    if (in) {
+        char line[1024];
+        while (fgets(line, sizeof(line), in)) {
+            const char* hp = strstr(line, " hash=");
+            if (hp && strlen(hp + 6) >= 64) {
+                memcpy(prev_hash, hp + 6, 64);
+                prev_hash[64] = '\0';
+            }
+        }
+        fclose(in);
     }
+
     FILE* out = fopen(path, "a");
     if (!out) return;
     time_t now = time(NULL);
@@ -10395,10 +10648,93 @@ void audit_log_statement(const char* command, const char* detail, bool success) 
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_buf);
     const char* actor = g_network_user[0] ? g_network_user :
                         (g_interactive_shell ? "local-shell" : "local-process");
-    fprintf(out, "[%s] actor=%s command=%s target=%s result=%s\n",
-            timestamp, actor, command,
-            detail && detail[0] ? detail : "-", success ? "OK" : "FAILED");
+
+    char record[1024];
+    snprintf(record, sizeof(record), "[%s] actor=%s command=%s target=%s result=%s prev_hash=%s",
+             timestamp, actor, command,
+             detail && detail[0] ? detail : "-", success ? "OK" : "FAILED", prev_hash);
+    char current_hash[65] = {0};
+    compute_audit_sha256(record, strlen(record), current_hash);
+
+    fprintf(out, "%s hash=%s\n", record, current_hash);
     fclose(out);
+}
+
+bool verify_audit_log(const char* path, char* error_out, size_t error_cap) {
+    if (!path || !path[0]) {
+        snprintf(error_out, error_cap, "invalid audit log path");
+        return false;
+    }
+    FILE* file = fopen(path, "r");
+    if (!file) {
+        snprintf(error_out, error_cap, "cannot open audit log file: %s", path);
+        return false;
+    }
+    char expected_prev[65] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    char line[1024];
+    int line_num = 0;
+    while (fgets(line, sizeof(line), file)) {
+        line_num++;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) line[--len] = '\0';
+        if (len == 0) continue;
+
+        const char* prev_ptr = strstr(line, " prev_hash=");
+        const char* hash_ptr = strstr(line, " hash=");
+        if (!prev_ptr || !hash_ptr || hash_ptr <= prev_ptr) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: missing cryptographic hash chaining metadata", line_num);
+            return false;
+        }
+
+        char rec_prev[65] = {0};
+        char rec_hash[65] = {0};
+        if (strlen(prev_ptr + 11) < 64 || strlen(hash_ptr + 6) < 64) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: truncated hash metadata", line_num);
+            return false;
+        }
+        memcpy(rec_prev, prev_ptr + 11, 64);
+        memcpy(rec_hash, hash_ptr + 6, 64);
+
+        if (strcmp(rec_prev, expected_prev) != 0) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: hash chain broken (expected prev_hash %s, found %s)",
+                     line_num, expected_prev, rec_prev);
+            return false;
+        }
+
+        size_t prefix_len = (size_t)(hash_ptr - line);
+        char computed_hash[65] = {0};
+        compute_audit_sha256(line, prefix_len, computed_hash);
+        if (strcmp(computed_hash, rec_hash) != 0) {
+            fclose(file);
+            snprintf(error_out, error_cap, "Line %d: entry content tampered (computed %s, recorded %s)",
+                     line_num, computed_hash, rec_hash);
+            return false;
+        }
+
+        memcpy(expected_prev, rec_hash, 65);
+    }
+    fclose(file);
+    if (line_num == 0) snprintf(error_out, error_cap, "audit log is empty");
+    else snprintf(error_out, error_cap, "verified %d audit entries; cryptographic hash chain intact", line_num);
+    return true;
+}
+
+bool execute_verify_audit_log(void) {
+    char path[PATH_CAP];
+    if (!get_audit_path(path, sizeof(path))) {
+        return report_database_error("cannot determine audit log path");
+    }
+    char msg[256];
+    bool ok = verify_audit_log(path, msg, sizeof(msg));
+    if (ok) {
+        printf("AUDIT VERIFICATION: OK (%s)\n", msg);
+    } else {
+        report_database_error("AUDIT VERIFICATION FAILED: %s", msg);
+    }
+    return ok;
 }
 
 void log_error_report(const char* format, ...) {
@@ -10577,6 +10913,28 @@ void print_active_sessions(void) {
     printf("\n%d active session%s.\n", count, count == 1 ? "" : "s");
 }
 
+int get_active_session_count(void) {
+    int count = 0;
+    for (int i = 0; i < MAX_CLIENT_SESSIONS; i++) {
+        if (g_sessions[i].active && !g_sessions[i].killed) count++;
+    }
+    return count;
+}
+
+#define MAX_PREPARED_STMTS 16
+#define MAX_PORTALS 16
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char query[MAX_QUERY_LEN / 4];
+    bool in_use;
+} PreparedStatement;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char bound_query[MAX_QUERY_LEN / 4];
+    bool in_use;
+} Portal;
+
 typedef struct {
     socket_t sock;
     int session_id;
@@ -10592,6 +10950,9 @@ typedef struct {
     size_t output_len, output_sent, output_cap;
     OutputFormat format;
     time_t accepted_at, last_activity;
+    char trace_id[64];
+    PreparedStatement stmts[MAX_PREPARED_STMTS];
+    Portal portals[MAX_PORTALS];
 #ifdef OPENDATA_TLS
 #ifdef _WIN32
     CtxtHandle tls;
@@ -10946,20 +11307,40 @@ static void send_results(WireClient* c, const QueryResultCapture* cap) {
     }
 }
 
-static void execute_wire_query(WireClient* c, const char* sql) {
+static void extract_opentelemetry_trace(WireClient* c, const char* sql) {
+    const char* tp = strstr(sql, "traceparent:");
+    if (!tp) tp = strstr(sql, "traceparent=");
+    if (!tp) tp = strstr(sql, "trace_id=");
+    if (tp) {
+        tp = strchr(tp, tp[11] == ':' ? ':' : '=');
+        if (tp) {
+            tp++;
+            while (*tp == ' ') tp++;
+            size_t i = 0;
+            while (i < sizeof(c->trace_id) - 1 && tp[i] && tp[i] != ' ' && tp[i] != '*' && tp[i] != ';' && tp[i] != '\r' && tp[i] != '\n') {
+                c->trace_id[i] = tp[i];
+                i++;
+            }
+            c->trace_id[i] = '\0';
+        }
+    }
+}
+
+static void execute_wire_query_internal(WireClient* c, const char* sql, bool emit_ready) {
     lock_engine_state();
+    extract_opentelemetry_trace(c, sql);
     int user_index = find_user_index(g_committed, c->user);
     if (user_index < 0 || g_committed->users[user_index].disabled) {
         wire_error(c, "account is disabled or no longer exists");
         c->closing = true;
-        if (c->pg) pg_ready(c);
+        if (c->pg && emit_ready) pg_ready(c);
         unlock_engine_state();
         return;
     }
     c->role = g_committed->users[user_index].role;
     if (g_wire_transaction_owner && g_wire_transaction_owner != c->session_id) {
         wire_error(c, "another session owns the active transaction");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -11027,7 +11408,7 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         wire_error(c, c->role == USER_ROLE_READ_ONLY ?
                    "permission denied for this statement (check table grants with your administrator)" :
                    "command is not permitted over the network");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -11036,7 +11417,7 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         !token_is_keyword(&parser, "WITH") &&
         !token_is_keyword(&parser, "EXPLAIN")) {
         wire_error(c, "follower nodes accept read-only queries");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -11076,8 +11457,285 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         } else if (capture.col_count == 0) wire_str(c, "OK\r\n");
     }
     free(capture.rows);
-    if (c->pg) pg_ready(c); else wire_str(c, "> ");
+    if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
     unlock_engine_state();
+}
+
+static void execute_wire_query(WireClient* c, const char* sql) {
+    execute_wire_query_internal(c, sql, true);
+}
+
+static PreparedStatement* find_prepared_stmt(WireClient* c, const char* name) {
+    for (int i = 0; i < MAX_PREPARED_STMTS; i++) {
+        if (c->stmts[i].in_use && strcmp(c->stmts[i].name, name) == 0)
+            return &c->stmts[i];
+    }
+    return NULL;
+}
+
+static PreparedStatement* alloc_prepared_stmt(WireClient* c, const char* name) {
+    PreparedStatement* slot = find_prepared_stmt(c, name);
+    if (slot) return slot;
+    for (int i = 0; i < MAX_PREPARED_STMTS; i++) {
+        if (!c->stmts[i].in_use) {
+            c->stmts[i].in_use = true;
+            snprintf(c->stmts[i].name, sizeof(c->stmts[i].name), "%s", name);
+            return &c->stmts[i];
+        }
+    }
+    c->stmts[0].in_use = true;
+    snprintf(c->stmts[0].name, sizeof(c->stmts[0].name), "%s", name);
+    return &c->stmts[0];
+}
+
+static Portal* find_portal(WireClient* c, const char* name) {
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (c->portals[i].in_use && strcmp(c->portals[i].name, name) == 0)
+            return &c->portals[i];
+    }
+    return NULL;
+}
+
+static Portal* alloc_portal(WireClient* c, const char* name) {
+    Portal* slot = find_portal(c, name);
+    if (slot) return slot;
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (!c->portals[i].in_use) {
+            c->portals[i].in_use = true;
+            snprintf(c->portals[i].name, sizeof(c->portals[i].name), "%s", name);
+            return &c->portals[i];
+        }
+    }
+    c->portals[0].in_use = true;
+    snprintf(c->portals[0].name, sizeof(c->portals[0].name), "%s", name);
+    return &c->portals[0];
+}
+
+static void process_pg_parse(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Parse message"); return; }
+    const char* stmt_name = (const char*)p;
+    size_t stmt_name_len = strlen(stmt_name);
+    if (stmt_name_len + 1 >= body_len) { wire_error(c, "malformed Parse statement name"); return; }
+    const char* query = (const char*)p + stmt_name_len + 1;
+    size_t query_len = strlen(query);
+    if (stmt_name_len + 1 + query_len + 1 > body_len) { wire_error(c, "malformed Parse query"); return; }
+
+    PreparedStatement* stmt = alloc_prepared_stmt(c, stmt_name);
+    snprintf(stmt->query, sizeof(stmt->query), "%s", query);
+    pg_header(c, '1', 0); /* ParseComplete */
+}
+
+static bool is_param_numeric(const char* val, size_t len) {
+    if (len == 0) return false;
+    size_t i = 0;
+    if (val[0] == '-' || val[0] == '+') i++;
+    if (i >= len) return false;
+    bool has_dot = false;
+    for (; i < len; i++) {
+        if (val[i] == '.') {
+            if (has_dot) return false;
+            has_dot = true;
+        } else if (!is_ascii_digit(val[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void process_pg_bind(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 4) { wire_error(c, "malformed Bind message"); return; }
+    const char* portal_name = (const char*)p;
+    size_t portal_name_len = strlen(portal_name);
+    if (portal_name_len + 1 >= body_len) { wire_error(c, "malformed Bind portal name"); return; }
+    const char* stmt_name = (const char*)p + portal_name_len + 1;
+    size_t stmt_name_len = strlen(stmt_name);
+    size_t off = portal_name_len + 1 + stmt_name_len + 1;
+    if (off + 2 > body_len) { wire_error(c, "malformed Bind format count"); return; }
+
+    uint16_t num_formats = (uint16_t)(((uint16_t)p[off] << 8) | p[off + 1]); off += 2;
+    if (off + (size_t)num_formats * 2 + 2 > body_len) { wire_error(c, "malformed Bind format codes"); return; }
+    off += (size_t)num_formats * 2;
+
+    uint16_t num_params = (uint16_t)(((uint16_t)p[off] << 8) | p[off + 1]); off += 2;
+    #define MAX_BIND_PARAMS 32
+    char param_strs[MAX_BIND_PARAMS][MAX_VAL_LEN];
+    bool param_nulls[MAX_BIND_PARAMS];
+    memset(param_nulls, 0, sizeof(param_nulls));
+
+    for (uint16_t i = 0; i < num_params; i++) {
+        if (off + 4 > body_len) { wire_error(c, "malformed Bind param length"); return; }
+        int32_t val_len = (int32_t)pg_read_u32(p + off); off += 4;
+        if (val_len < 0) {
+            if (i < MAX_BIND_PARAMS) param_nulls[i] = true;
+        } else {
+            if (off + (size_t)val_len > body_len) { wire_error(c, "malformed Bind param value"); return; }
+            if (i < MAX_BIND_PARAMS) {
+                size_t copy_len = (size_t)val_len < sizeof(param_strs[i]) - 1 ? (size_t)val_len : sizeof(param_strs[i]) - 1;
+                memcpy(param_strs[i], p + off, copy_len);
+                param_strs[i][copy_len] = '\0';
+                param_nulls[i] = false;
+            }
+            off += (size_t)val_len;
+        }
+    }
+
+    PreparedStatement* stmt = find_prepared_stmt(c, stmt_name);
+    if (!stmt) { wire_error(c, "prepared statement does not exist"); return; }
+
+    /* Substitute parameters ($1, $2, ... or ?) into portal's bound_query */
+    Portal* portal = alloc_portal(c, portal_name);
+    char* dst = portal->bound_query;
+    size_t dst_cap = sizeof(portal->bound_query);
+    size_t dst_len = 0;
+    const char* src = stmt->query;
+    int auto_param_idx = 0;
+
+    while (*src && dst_len + 4 < dst_cap) {
+        if (*src == '$' && is_ascii_digit(src[1])) {
+            src++;
+            int param_idx = 0;
+            while (is_ascii_digit(*src)) {
+                param_idx = param_idx * 10 + (*src - '0');
+                src++;
+            }
+            param_idx--; /* 1-based to 0-based */
+            if (param_idx >= 0 && param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
+                if (param_nulls[param_idx]) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                } else {
+                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                        if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
+                        else dst[dst_len++] = *cp;
+                    }
+                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    dst[dst_len] = '\0';
+                }
+            }
+        } else if (*src == '?') {
+            src++;
+            int param_idx = auto_param_idx++;
+            if (param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
+                if (param_nulls[param_idx]) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                } else {
+                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                        if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
+                        else dst[dst_len++] = *cp;
+                    }
+                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    dst[dst_len] = '\0';
+                }
+            }
+        } else {
+            dst[dst_len++] = *src++;
+            dst[dst_len] = '\0';
+        }
+    }
+    portal->bound_query[dst_len] = '\0';
+    pg_header(c, '2', 0); /* BindComplete */
+}
+
+static void process_pg_describe(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Describe message"); return; }
+    (void)p;
+    unsigned char nodata[5] = {'n', 0, 0, 0, 4};
+    wire_send(c, nodata, sizeof(nodata));
+}
+
+static void process_pg_execute(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 5) { wire_error(c, "malformed Execute message"); return; }
+    const char* portal_name = (const char*)p;
+    Portal* portal = find_portal(c, portal_name);
+    if (!portal) { wire_error(c, "portal does not exist"); return; }
+    execute_wire_query_internal(c, portal->bound_query, false);
+}
+
+static void process_pg_close(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Close message"); return; }
+    char type = (char)p[0];
+    const char* name = (const char*)p + 1;
+    if (type == 'S') {
+        PreparedStatement* stmt = find_prepared_stmt(c, name);
+        if (stmt) memset(stmt, 0, sizeof(*stmt));
+    } else if (type == 'P') {
+        Portal* portal = find_portal(c, name);
+        if (portal) memset(portal, 0, sizeof(*portal));
+    }
+    pg_header(c, '3', 0); /* CloseComplete */
+}
+
+static void send_http_metrics(WireClient* c) {
+    AuthRateLimitStats arl_stats = auth_rate_limit_stats();
+    int active_sessions = get_active_session_count();
+    int tables = g_committed ? g_committed->table_count : 0;
+    uint64_t gen = g_generation;
+    RaftRole role = atomic_load(&g_raft_role);
+    uint32_t term = raft_get_current_term();
+
+    char body[2048];
+    int body_len = snprintf(body, sizeof(body),
+        "# HELP opendata_up Whether the server is running\n"
+        "# TYPE opendata_up gauge\n"
+        "opendata_up 1\n"
+        "# HELP opendata_active_sessions Active client network sessions\n"
+        "# TYPE opendata_active_sessions gauge\n"
+        "opendata_active_sessions %d\n"
+        "# HELP opendata_tables_total Total database tables\n"
+        "# TYPE opendata_tables_total gauge\n"
+        "opendata_tables_total %d\n"
+        "# HELP opendata_generation Database snapshot generation\n"
+        "# TYPE opendata_generation counter\n"
+        "opendata_generation %llu\n"
+        "# HELP opendata_raft_role Raft consensus role (0=Follower, 1=Candidate, 2=Leader)\n"
+        "# TYPE opendata_raft_role gauge\n"
+        "opendata_raft_role %d\n"
+        "# HELP opendata_raft_term Raft current term\n"
+        "# TYPE opendata_raft_term counter\n"
+        "opendata_raft_term %u\n"
+        "# HELP opendata_auth_admitted_total Successful authentications\n"
+        "# TYPE opendata_auth_admitted_total counter\n"
+        "opendata_auth_admitted_total %llu\n"
+        "# HELP opendata_auth_failures_total Credential authentication failures\n"
+        "# TYPE opendata_auth_failures_total counter\n"
+        "opendata_auth_failures_total %llu\n"
+        "# HELP opendata_auth_throttled_total Throttled authentication attempts\n"
+        "# TYPE opendata_auth_throttled_total counter\n"
+        "opendata_auth_throttled_total %llu\n",
+        active_sessions, tables, (unsigned long long)gen,
+        (int)role, term,
+        (unsigned long long)arl_stats.admitted,
+        (unsigned long long)arl_stats.credential_failures,
+        (unsigned long long)(arl_stats.source_throttled + arl_stats.pair_throttled + arl_stats.global_throttled));
+
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n", body_len);
+
+    wire_send(c, header, (size_t)header_len);
+    wire_send(c, body, (size_t)body_len);
+    c->closing = true;
+}
+
+static void send_http_health(WireClient* c) {
+    const char* body = "{\"status\":\"UP\",\"server\":\"" SERVER_VERSION "\"}\r\n";
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n", strlen(body));
+    wire_send(c, header, (size_t)header_len);
+    wire_send(c, body, strlen(body));
+    c->closing = true;
 }
 
 static bool pg_startup(WireClient* c, const unsigned char* p, size_t length) {
@@ -11132,6 +11790,20 @@ static void process_pg(WireClient* c) {
         } else if (p[0] == 'Q' && length >= 6 && p[length - 1] == 0 &&
                    memchr(p + 5, 0, length - 6) == NULL) {
             execute_wire_query(c, (const char*)p + 5);
+        } else if (p[0] == 'P') {
+            process_pg_parse(c, p + 5, length - 5);
+        } else if (p[0] == 'B') {
+            process_pg_bind(c, p + 5, length - 5);
+        } else if (p[0] == 'D') {
+            process_pg_describe(c, p + 5, length - 5);
+        } else if (p[0] == 'E') {
+            process_pg_execute(c, p + 5, length - 5);
+        } else if (p[0] == 'S') {
+            pg_ready(c);
+        } else if (p[0] == 'C') {
+            process_pg_close(c, p + 5, length - 5);
+        } else if (p[0] == 'H') {
+            /* Flush - buffered writes already handled */
         } else {
             wire_error(c, "unsupported or malformed protocol message"); c->closing = true;
         }
@@ -11144,6 +11816,17 @@ static void process_pg(WireClient* c) {
 
 static void process_text(WireClient* c) {
     if (!c->authenticated) {
+        if (strncmp(c->input, "GET /metrics", 12) == 0) {
+            send_http_metrics(c);
+            return;
+        } else if (strncmp(c->input, "GET /health", 11) == 0 || strncmp(c->input, "GET / ", 6) == 0 || !strcmp(c->input, "GET /")) {
+            send_http_health(c);
+            return;
+        } else if (strncmp(c->input, "GET ", 4) == 0 || strncmp(c->input, "HEAD ", 5) == 0) {
+            wire_str(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            c->closing = true;
+            return;
+        }
         if (strncmp(c->input, "AUTH ", 5) != 0) {
             wire_error(c, "authentication required: AUTH <user> <password>");
             c->closing = true;
@@ -11163,7 +11846,11 @@ static void process_text(WireClient* c) {
     size_t length = strlen(cmd);
     while (length && (is_sql_whitespace(cmd[length - 1]) || cmd[length - 1] == ';')) cmd[--length] = 0;
     if (!length) return;
-    if (!strcmp(cmd, "PING") || !strcmp(cmd, "ping")) wire_str(c, "PONG\r\n> ");
+    if (strncmp(cmd, "GET /metrics", 12) == 0) {
+        send_http_metrics(c);
+    } else if (strncmp(cmd, "GET /health", 11) == 0 || strncmp(cmd, "GET / ", 6) == 0 || !strcmp(cmd, "GET /")) {
+        send_http_health(c);
+    } else if (!strcmp(cmd, "PING") || !strcmp(cmd, "ping")) wire_str(c, "PONG\r\n> ");
     else if (!strcmp(cmd, "EXIT") || !strcmp(cmd, "QUIT") || !strcmp(cmd, "exit") || !strcmp(cmd, "quit")) {
         wire_str(c, "BYE\r\n"); c->closing = true;
     } else if (!strcmp(cmd, ".mode json") || !strcmp(cmd, "SET FORMAT JSON")) {
@@ -11178,7 +11865,10 @@ static void process_text(WireClient* c) {
 static void receive_input(WireClient* c, const unsigned char* bytes, size_t length) {
     if (!c->detected && length) {
         c->detected = true;
-        c->pg = bytes[0] == 0;
+        c->pg = (bytes[0] == 0);
+        if (length >= 4 && (memcmp(bytes, "GET ", 4) == 0 || memcmp(bytes, "HEAD", 4) == 0)) {
+            c->authenticated = true; /* HTTP endpoints (/metrics, /health) are public scrape targets */
+        }
     }
     if (c->pg) {
         if (length >= sizeof(c->input) - c->used) {
@@ -13451,6 +14141,36 @@ static _Atomic uint32_t g_voted_for_term = 0;
 static _Atomic int g_voted_for_node = 0;
 static int g_peer_count = 0;
 static char g_peer_addrs[4][64];
+
+uint32_t raft_get_current_term(void) {
+    return atomic_load(&g_current_term);
+}
+
+bool raft_add_peer(const char* peer_addr) {
+    if (!peer_addr || g_peer_count >= 4) return false;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (strcmp(g_peer_addrs[i], peer_addr) == 0) return true;
+    }
+    snprintf(g_peer_addrs[g_peer_count++], sizeof(g_peer_addrs[0]), "%s", peer_addr);
+    return true;
+}
+
+bool raft_remove_peer(int node_id) {
+    for (int i = 0; i < g_peer_count; i++) {
+        const char* at = strchr(g_peer_addrs[i], '@');
+        if (at) {
+            int nid = atoi(g_peer_addrs[i]);
+            if (nid == node_id) {
+                for (int j = i; j < g_peer_count - 1; j++) {
+                    memcpy(g_peer_addrs[j], g_peer_addrs[j + 1], sizeof(g_peer_addrs[0]));
+                }
+                g_peer_count--;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 static ClusterTlsContext* g_cluster_tls;
 static socket_t g_cluster_listener = INVALID_SOCK;
 static atomic_bool g_cluster_running = false;
@@ -13755,6 +14475,8 @@ static bool is_configured_peer(struct in_addr address, int expected_node_id) {
     return false;
 }
 
+static _Atomic uint64_t g_last_heartbeat_ms = 0;
+
 #ifdef _WIN32
 static DWORD WINAPI cluster_follower_worker(LPVOID unused) {
 #else
@@ -13767,6 +14489,62 @@ static void* cluster_follower_worker(void* unused) {
         FD_SET(g_cluster_listener, &fds);
         struct timeval tv = {0, 200000};
         int sel = select((int)g_cluster_listener + 1, &fds, NULL, NULL, &tv);
+        uint64_t now_ms = (uint64_t)(monotonic_seconds() * 1000.0);
+        uint64_t last_hb = atomic_load(&g_last_heartbeat_ms);
+        if (last_hb == 0) {
+            atomic_store(&g_last_heartbeat_ms, now_ms);
+        } else if (atomic_load(&g_raft_role) == RAFT_FOLLOWER && g_peer_count > 0 &&
+                   now_ms > last_hb && (now_ms - last_hb) > 3000) {
+            /* Heartbeat timeout: transition to CANDIDATE and run leader election */
+            atomic_store(&g_raft_role, RAFT_CANDIDATE);
+            uint32_t term = atomic_fetch_add(&g_current_term, 1) + 1;
+            atomic_store(&g_voted_for_term, term);
+            atomic_store(&g_voted_for_node, g_raft_node_id);
+            atomic_store(&g_last_heartbeat_ms, now_ms);
+
+            int votes = 1; /* Self vote */
+            for (int i = 0; i < g_peer_count; i++) {
+                int peer_node_id = 0, peer_port = 0;
+                char peer_host[64];
+                if (!parse_peer_endpoint(g_peer_addrs[i], &peer_node_id, peer_host, sizeof(peer_host), &peer_port)) continue;
+                struct sockaddr_in dest;
+                memset(&dest, 0, sizeof(dest));
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons((uint16_t)peer_port);
+                inet_pton(AF_INET, peer_host, &dest.sin_addr);
+                socket_t ps = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (ps != INVALID_SOCK) {
+                    if (raft_connect_with_timeout(ps, &dest, 400)) {
+                        ClusterTlsStream* psec = cluster_stream_connect(ps, peer_host, peer_node_id);
+                        if (psec) {
+                            RaftHeader vreq = raft_header_to_wire((RaftHeader){
+                                RAFT_MAGIC, RAFT_MSG_VOTE_REQ, term, (uint32_t)g_raft_node_id, 0
+                            });
+                            if (cluster_stream_send_all(ps, psec, &vreq, sizeof(vreq))) {
+                                RaftHeader vrsp;
+                                if (cluster_stream_recv_all(ps, psec, &vrsp, sizeof(vrsp))) {
+                                    vrsp = raft_header_from_wire(vrsp);
+                                    if (vrsp.magic == RAFT_MAGIC && vrsp.msg_type == RAFT_MSG_VOTE_RSP && vrsp.payload_len == 1) {
+                                        votes++;
+                                    }
+                                }
+                            }
+                            cluster_stream_close(psec);
+                        }
+                    }
+                    CLOSE_SOCK(ps);
+                }
+            }
+            int majority = (g_peer_count + 1) / 2 + 1;
+            if (votes >= majority) {
+                atomic_store(&g_raft_role, RAFT_LEADER);
+                g_sync_replication = true;
+                fprintf(stderr, "[Raft] Node %d elected LEADER for term %u (%d/%d votes)\n",
+                        g_raft_node_id, term, votes, g_peer_count + 1);
+            } else {
+                atomic_store(&g_raft_role, RAFT_FOLLOWER);
+            }
+        }
         if (sel > 0 && FD_ISSET(g_cluster_listener, &fds)) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = (socklen_t)sizeof(client_addr);
@@ -13785,6 +14563,7 @@ static void* cluster_follower_worker(void* unused) {
                         g_raft_role == RAFT_FOLLOWER && hdr.node_id != (uint32_t)g_raft_node_id &&
                         is_configured_peer(client_addr.sin_addr, expected_node_id) &&
                         cluster_stream_auth_matches(secure, expected_node_id)) {
+                        atomic_store(&g_last_heartbeat_ms, (uint64_t)(monotonic_seconds() * 1000.0));
                         if (hdr.payload_len > 0 && hdr.payload_len <= MAX_IMAGE) {
                             unsigned char* payload = malloc(hdr.payload_len);
                             if (payload && cluster_stream_recv_all(s, secure, payload, hdr.payload_len)) {
@@ -15248,7 +16027,7 @@ static const char* suggest_command_word(const char* word) {
         "DISCONNECT", "EXIT", "QUIT", "BACKUP", "RESTART", "CHECK", "VACUUM",
         "COMPACT", "DUMP", "DIFF", "BENCHMARK", "WATCH", "HISTORY", "SPOOL",
         "SOURCE", "SET", "CLEAR", "CLS", "CANCEL", "PING", "LOAD", "SUPPORT",
-        "CONNECTION", "KILL", "IRIS", "EDIT"
+        "CONNECTION", "KILL", "IRIS", "EDIT", "VERIFY"
     };
     return suggest_word(word, commands, sizeof(commands) / sizeof(commands[0]));
 }
@@ -15256,7 +16035,7 @@ static const char* suggest_command_word(const char* word) {
 static const char* suggest_show_word(const char* word) {
     static const char* const targets[] = {
         "TABLES", "DATABASES", "USERS", "USER", "SESSIONS", "PROCESSLIST",
-        "SCHEMA", "CLUSTER", "ENGINE", "CREATE", "STATS", "CONSTRAINTS"
+        "SCHEMA", "CLUSTER", "ENGINE", "CREATE", "STATS", "CONSTRAINTS", "METRICS"
     };
     return suggest_word(word, targets, sizeof(targets) / sizeof(targets[0]));
 }
@@ -16832,6 +17611,26 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
     } else if (!strcmp(command, "SHOW") && consume_keyword(&p, "CLUSTER")) {
         ok = consume_statement_end(&p);
         if (ok) print_cluster_status();
+    } else if (!strcmp(command, "SHOW") && consume_keyword(&p, "METRICS")) {
+        ok = consume_statement_end(&p);
+        if (ok) {
+            AuthRateLimitStats arl_stats = auth_rate_limit_stats();
+            shell_puts("METRIC\tVALUE");
+            shell_puts("opendata_up\t1");
+            shell_printf("opendata_active_sessions\t%d\n", get_active_session_count());
+            shell_printf("opendata_database_tables\t%d\n", g_committed ? g_committed->table_count : 0);
+            shell_printf("opendata_database_generation\t%llu\n", (unsigned long long)g_generation);
+            shell_printf("opendata_raft_role\t%s (%d)\n",
+                         g_raft_role == RAFT_LEADER ? "LEADER" : (g_raft_role == RAFT_CANDIDATE ? "CANDIDATE" : "FOLLOWER"),
+                         (int)g_raft_role);
+            shell_printf("opendata_raft_term\t%u\n", raft_get_current_term());
+            shell_printf("opendata_auth_admitted_total\t%llu\n", (unsigned long long)arl_stats.admitted);
+            shell_printf("opendata_auth_failures_total\t%llu\n", (unsigned long long)arl_stats.credential_failures);
+            shell_printf("opendata_auth_throttled_total\t%llu\n",
+                         (unsigned long long)(arl_stats.source_throttled + arl_stats.pair_throttled + arl_stats.global_throttled));
+        }
+    } else if (!strcmp(command, "VERIFY") && (consume_keyword(&p, "AUDIT") || consume_keyword(&p, "AUDIT_LOG"))) {
+        ok = consume_statement_end(&p) && execute_verify_audit_log();
     } else if (!strcmp(command, "DROP") && consume_keyword(&p, "DATABASE")) {
         ok = execute_drop_database_statement(&p);
     } else if (!g_db) {

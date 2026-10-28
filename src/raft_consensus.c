@@ -32,6 +32,36 @@ static _Atomic uint32_t g_voted_for_term = 0;
 static _Atomic int g_voted_for_node = 0;
 static int g_peer_count = 0;
 static char g_peer_addrs[4][64];
+
+uint32_t raft_get_current_term(void) {
+    return atomic_load(&g_current_term);
+}
+
+bool raft_add_peer(const char* peer_addr) {
+    if (!peer_addr || g_peer_count >= 4) return false;
+    for (int i = 0; i < g_peer_count; i++) {
+        if (strcmp(g_peer_addrs[i], peer_addr) == 0) return true;
+    }
+    snprintf(g_peer_addrs[g_peer_count++], sizeof(g_peer_addrs[0]), "%s", peer_addr);
+    return true;
+}
+
+bool raft_remove_peer(int node_id) {
+    for (int i = 0; i < g_peer_count; i++) {
+        const char* at = strchr(g_peer_addrs[i], '@');
+        if (at) {
+            int nid = atoi(g_peer_addrs[i]);
+            if (nid == node_id) {
+                for (int j = i; j < g_peer_count - 1; j++) {
+                    memcpy(g_peer_addrs[j], g_peer_addrs[j + 1], sizeof(g_peer_addrs[0]));
+                }
+                g_peer_count--;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 static ClusterTlsContext* g_cluster_tls;
 static socket_t g_cluster_listener = INVALID_SOCK;
 static atomic_bool g_cluster_running = false;
@@ -336,6 +366,8 @@ static bool is_configured_peer(struct in_addr address, int expected_node_id) {
     return false;
 }
 
+static _Atomic uint64_t g_last_heartbeat_ms = 0;
+
 #ifdef _WIN32
 static DWORD WINAPI cluster_follower_worker(LPVOID unused) {
 #else
@@ -348,6 +380,62 @@ static void* cluster_follower_worker(void* unused) {
         FD_SET(g_cluster_listener, &fds);
         struct timeval tv = {0, 200000};
         int sel = select((int)g_cluster_listener + 1, &fds, NULL, NULL, &tv);
+        uint64_t now_ms = (uint64_t)(monotonic_seconds() * 1000.0);
+        uint64_t last_hb = atomic_load(&g_last_heartbeat_ms);
+        if (last_hb == 0) {
+            atomic_store(&g_last_heartbeat_ms, now_ms);
+        } else if (atomic_load(&g_raft_role) == RAFT_FOLLOWER && g_peer_count > 0 &&
+                   now_ms > last_hb && (now_ms - last_hb) > 3000) {
+            /* Heartbeat timeout: transition to CANDIDATE and run leader election */
+            atomic_store(&g_raft_role, RAFT_CANDIDATE);
+            uint32_t term = atomic_fetch_add(&g_current_term, 1) + 1;
+            atomic_store(&g_voted_for_term, term);
+            atomic_store(&g_voted_for_node, g_raft_node_id);
+            atomic_store(&g_last_heartbeat_ms, now_ms);
+
+            int votes = 1; /* Self vote */
+            for (int i = 0; i < g_peer_count; i++) {
+                int peer_node_id = 0, peer_port = 0;
+                char peer_host[64];
+                if (!parse_peer_endpoint(g_peer_addrs[i], &peer_node_id, peer_host, sizeof(peer_host), &peer_port)) continue;
+                struct sockaddr_in dest;
+                memset(&dest, 0, sizeof(dest));
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons((uint16_t)peer_port);
+                inet_pton(AF_INET, peer_host, &dest.sin_addr);
+                socket_t ps = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (ps != INVALID_SOCK) {
+                    if (raft_connect_with_timeout(ps, &dest, 400)) {
+                        ClusterTlsStream* psec = cluster_stream_connect(ps, peer_host, peer_node_id);
+                        if (psec) {
+                            RaftHeader vreq = raft_header_to_wire((RaftHeader){
+                                RAFT_MAGIC, RAFT_MSG_VOTE_REQ, term, (uint32_t)g_raft_node_id, 0
+                            });
+                            if (cluster_stream_send_all(ps, psec, &vreq, sizeof(vreq))) {
+                                RaftHeader vrsp;
+                                if (cluster_stream_recv_all(ps, psec, &vrsp, sizeof(vrsp))) {
+                                    vrsp = raft_header_from_wire(vrsp);
+                                    if (vrsp.magic == RAFT_MAGIC && vrsp.msg_type == RAFT_MSG_VOTE_RSP && vrsp.payload_len == 1) {
+                                        votes++;
+                                    }
+                                }
+                            }
+                            cluster_stream_close(psec);
+                        }
+                    }
+                    CLOSE_SOCK(ps);
+                }
+            }
+            int majority = (g_peer_count + 1) / 2 + 1;
+            if (votes >= majority) {
+                atomic_store(&g_raft_role, RAFT_LEADER);
+                g_sync_replication = true;
+                fprintf(stderr, "[Raft] Node %d elected LEADER for term %u (%d/%d votes)\n",
+                        g_raft_node_id, term, votes, g_peer_count + 1);
+            } else {
+                atomic_store(&g_raft_role, RAFT_FOLLOWER);
+            }
+        }
         if (sel > 0 && FD_ISSET(g_cluster_listener, &fds)) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = (socklen_t)sizeof(client_addr);
@@ -366,6 +454,7 @@ static void* cluster_follower_worker(void* unused) {
                         g_raft_role == RAFT_FOLLOWER && hdr.node_id != (uint32_t)g_raft_node_id &&
                         is_configured_peer(client_addr.sin_addr, expected_node_id) &&
                         cluster_stream_auth_matches(secure, expected_node_id)) {
+                        atomic_store(&g_last_heartbeat_ms, (uint64_t)(monotonic_seconds() * 1000.0));
                         if (hdr.payload_len > 0 && hdr.payload_len <= MAX_IMAGE) {
                             unsigned char* payload = malloc(hdr.payload_len);
                             if (payload && cluster_stream_recv_all(s, secure, payload, hdr.payload_len)) {

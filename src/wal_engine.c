@@ -51,6 +51,7 @@ bool wal_write_page_delta(uint32_t page_id, uint16_t offset, const void* data, u
     hdr.length = len;
     hdr.page_id = page_id;
     hdr.page_offset = offset;
+    hdr.reserved = (uint32_t)time(NULL);
     hdr.crc32 = wal_record_crc32(&hdr, data, len);
 
     if (fwrite(&hdr, sizeof(hdr), 1, g_wal_file) != 1) return false;
@@ -67,6 +68,7 @@ bool wal_commit_tx(uint32_t tx_id) {
     hdr.tx_id = tx_id;
     hdr.op = WAL_OP_COMMIT;
     hdr.length = 0;
+    hdr.reserved = (uint32_t)time(NULL);
     hdr.crc32 = 0;
 
     if (fwrite(&hdr, sizeof(hdr), 1, g_wal_file) != 1) return false;
@@ -95,7 +97,7 @@ bool wal_checkpoint_now(BufferPool* bp, int db_fd) {
     return g_wal_file != NULL;
 }
 
-bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
+bool wal_recover_and_replay_to_timestamp(int db_fd, BufferPool* bp, uint32_t target_timestamp) {
     if (!g_wal_path[0] || db_fd < 0) return false;
     FILE* file = NULL;
 #ifdef _WIN32
@@ -111,6 +113,10 @@ bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
     while (fread(&hdr, sizeof(hdr), 1, file) == 1) {
         if (hdr.magic != WAL_MAGIC) { ok = false; break; }
         if (hdr.length > PAGE_SIZE) { ok = false; break; }
+        if (target_timestamp > 0 && hdr.reserved > target_timestamp) {
+            /* Point-in-time recovery limit reached */
+            break;
+        }
         if (hdr.length > 0) {
             if (fread(buffer, 1, hdr.length, file) != hdr.length) { ok = false; break; }
             if (wal_record_crc32(&hdr, buffer, hdr.length) != hdr.crc32) { ok = false; break; }
@@ -129,6 +135,10 @@ bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
     fclose(file);
     if (ok) buffer_pool_flush_all(bp, db_fd);
     return ok;
+}
+
+bool wal_recover_and_replay(int db_fd, BufferPool* bp) {
+    return wal_recover_and_replay_to_timestamp(db_fd, bp, 0);
 }
 
 void wal_shutdown(void) {

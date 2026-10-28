@@ -16,6 +16,23 @@ char g_path[PATH_CAP], g_backup_dir[PATH_CAP];
 char g_network_user[MAX_NAME_LEN];
 bool g_network_tls_active;
 char g_last_error[MAX_VAL_LEN];
+char g_tde_key[65] = {0};
+bool g_tde_enabled = false;
+
+bool opendata_set_tde_key(const char* key_hex) {
+    if (!key_hex || !*key_hex) {
+        g_tde_enabled = false;
+        memset(g_tde_key, 0, sizeof(g_tde_key));
+        return true;
+    }
+    size_t len = strlen(key_hex);
+    if (len != 32 && len != 64) {
+        return report_database_error("TDE key must be 32 or 64 hex characters (128-bit or 256-bit)");
+    }
+    snprintf(g_tde_key, sizeof(g_tde_key), "%s", key_hex);
+    g_tde_enabled = true;
+    return true;
+}
 unsigned g_backup_interval = 60;
 atomic_bool g_stop, g_backup_failed;
 atomic_bool g_restart_requested;

@@ -132,6 +132,28 @@ void print_active_sessions(void) {
     printf("\n%d active session%s.\n", count, count == 1 ? "" : "s");
 }
 
+int get_active_session_count(void) {
+    int count = 0;
+    for (int i = 0; i < MAX_CLIENT_SESSIONS; i++) {
+        if (g_sessions[i].active && !g_sessions[i].killed) count++;
+    }
+    return count;
+}
+
+#define MAX_PREPARED_STMTS 16
+#define MAX_PORTALS 16
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char query[MAX_QUERY_LEN / 4];
+    bool in_use;
+} PreparedStatement;
+
+typedef struct {
+    char name[MAX_NAME_LEN];
+    char bound_query[MAX_QUERY_LEN / 4];
+    bool in_use;
+} Portal;
+
 typedef struct {
     socket_t sock;
     int session_id;
@@ -147,6 +169,9 @@ typedef struct {
     size_t output_len, output_sent, output_cap;
     OutputFormat format;
     time_t accepted_at, last_activity;
+    char trace_id[64];
+    PreparedStatement stmts[MAX_PREPARED_STMTS];
+    Portal portals[MAX_PORTALS];
 #ifdef OPENDATA_TLS
 #ifdef _WIN32
     CtxtHandle tls;
@@ -501,20 +526,40 @@ static void send_results(WireClient* c, const QueryResultCapture* cap) {
     }
 }
 
-static void execute_wire_query(WireClient* c, const char* sql) {
+static void extract_opentelemetry_trace(WireClient* c, const char* sql) {
+    const char* tp = strstr(sql, "traceparent:");
+    if (!tp) tp = strstr(sql, "traceparent=");
+    if (!tp) tp = strstr(sql, "trace_id=");
+    if (tp) {
+        tp = strchr(tp, tp[11] == ':' ? ':' : '=');
+        if (tp) {
+            tp++;
+            while (*tp == ' ') tp++;
+            size_t i = 0;
+            while (i < sizeof(c->trace_id) - 1 && tp[i] && tp[i] != ' ' && tp[i] != '*' && tp[i] != ';' && tp[i] != '\r' && tp[i] != '\n') {
+                c->trace_id[i] = tp[i];
+                i++;
+            }
+            c->trace_id[i] = '\0';
+        }
+    }
+}
+
+static void execute_wire_query_internal(WireClient* c, const char* sql, bool emit_ready) {
     lock_engine_state();
+    extract_opentelemetry_trace(c, sql);
     int user_index = find_user_index(g_committed, c->user);
     if (user_index < 0 || g_committed->users[user_index].disabled) {
         wire_error(c, "account is disabled or no longer exists");
         c->closing = true;
-        if (c->pg) pg_ready(c);
+        if (c->pg && emit_ready) pg_ready(c);
         unlock_engine_state();
         return;
     }
     c->role = g_committed->users[user_index].role;
     if (g_wire_transaction_owner && g_wire_transaction_owner != c->session_id) {
         wire_error(c, "another session owns the active transaction");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -582,7 +627,7 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         wire_error(c, c->role == USER_ROLE_READ_ONLY ?
                    "permission denied for this statement (check table grants with your administrator)" :
                    "command is not permitted over the network");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -591,7 +636,7 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         !token_is_keyword(&parser, "WITH") &&
         !token_is_keyword(&parser, "EXPLAIN")) {
         wire_error(c, "follower nodes accept read-only queries");
-        if (c->pg) pg_ready(c); else wire_str(c, "> ");
+        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
         unlock_engine_state();
         return;
     }
@@ -631,8 +676,285 @@ static void execute_wire_query(WireClient* c, const char* sql) {
         } else if (capture.col_count == 0) wire_str(c, "OK\r\n");
     }
     free(capture.rows);
-    if (c->pg) pg_ready(c); else wire_str(c, "> ");
+    if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
     unlock_engine_state();
+}
+
+static void execute_wire_query(WireClient* c, const char* sql) {
+    execute_wire_query_internal(c, sql, true);
+}
+
+static PreparedStatement* find_prepared_stmt(WireClient* c, const char* name) {
+    for (int i = 0; i < MAX_PREPARED_STMTS; i++) {
+        if (c->stmts[i].in_use && strcmp(c->stmts[i].name, name) == 0)
+            return &c->stmts[i];
+    }
+    return NULL;
+}
+
+static PreparedStatement* alloc_prepared_stmt(WireClient* c, const char* name) {
+    PreparedStatement* slot = find_prepared_stmt(c, name);
+    if (slot) return slot;
+    for (int i = 0; i < MAX_PREPARED_STMTS; i++) {
+        if (!c->stmts[i].in_use) {
+            c->stmts[i].in_use = true;
+            snprintf(c->stmts[i].name, sizeof(c->stmts[i].name), "%s", name);
+            return &c->stmts[i];
+        }
+    }
+    c->stmts[0].in_use = true;
+    snprintf(c->stmts[0].name, sizeof(c->stmts[0].name), "%s", name);
+    return &c->stmts[0];
+}
+
+static Portal* find_portal(WireClient* c, const char* name) {
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (c->portals[i].in_use && strcmp(c->portals[i].name, name) == 0)
+            return &c->portals[i];
+    }
+    return NULL;
+}
+
+static Portal* alloc_portal(WireClient* c, const char* name) {
+    Portal* slot = find_portal(c, name);
+    if (slot) return slot;
+    for (int i = 0; i < MAX_PORTALS; i++) {
+        if (!c->portals[i].in_use) {
+            c->portals[i].in_use = true;
+            snprintf(c->portals[i].name, sizeof(c->portals[i].name), "%s", name);
+            return &c->portals[i];
+        }
+    }
+    c->portals[0].in_use = true;
+    snprintf(c->portals[0].name, sizeof(c->portals[0].name), "%s", name);
+    return &c->portals[0];
+}
+
+static void process_pg_parse(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Parse message"); return; }
+    const char* stmt_name = (const char*)p;
+    size_t stmt_name_len = strlen(stmt_name);
+    if (stmt_name_len + 1 >= body_len) { wire_error(c, "malformed Parse statement name"); return; }
+    const char* query = (const char*)p + stmt_name_len + 1;
+    size_t query_len = strlen(query);
+    if (stmt_name_len + 1 + query_len + 1 > body_len) { wire_error(c, "malformed Parse query"); return; }
+
+    PreparedStatement* stmt = alloc_prepared_stmt(c, stmt_name);
+    snprintf(stmt->query, sizeof(stmt->query), "%s", query);
+    pg_header(c, '1', 0); /* ParseComplete */
+}
+
+static bool is_param_numeric(const char* val, size_t len) {
+    if (len == 0) return false;
+    size_t i = 0;
+    if (val[0] == '-' || val[0] == '+') i++;
+    if (i >= len) return false;
+    bool has_dot = false;
+    for (; i < len; i++) {
+        if (val[i] == '.') {
+            if (has_dot) return false;
+            has_dot = true;
+        } else if (!is_ascii_digit(val[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void process_pg_bind(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 4) { wire_error(c, "malformed Bind message"); return; }
+    const char* portal_name = (const char*)p;
+    size_t portal_name_len = strlen(portal_name);
+    if (portal_name_len + 1 >= body_len) { wire_error(c, "malformed Bind portal name"); return; }
+    const char* stmt_name = (const char*)p + portal_name_len + 1;
+    size_t stmt_name_len = strlen(stmt_name);
+    size_t off = portal_name_len + 1 + stmt_name_len + 1;
+    if (off + 2 > body_len) { wire_error(c, "malformed Bind format count"); return; }
+
+    uint16_t num_formats = (uint16_t)(((uint16_t)p[off] << 8) | p[off + 1]); off += 2;
+    if (off + (size_t)num_formats * 2 + 2 > body_len) { wire_error(c, "malformed Bind format codes"); return; }
+    off += (size_t)num_formats * 2;
+
+    uint16_t num_params = (uint16_t)(((uint16_t)p[off] << 8) | p[off + 1]); off += 2;
+    #define MAX_BIND_PARAMS 32
+    char param_strs[MAX_BIND_PARAMS][MAX_VAL_LEN];
+    bool param_nulls[MAX_BIND_PARAMS];
+    memset(param_nulls, 0, sizeof(param_nulls));
+
+    for (uint16_t i = 0; i < num_params; i++) {
+        if (off + 4 > body_len) { wire_error(c, "malformed Bind param length"); return; }
+        int32_t val_len = (int32_t)pg_read_u32(p + off); off += 4;
+        if (val_len < 0) {
+            if (i < MAX_BIND_PARAMS) param_nulls[i] = true;
+        } else {
+            if (off + (size_t)val_len > body_len) { wire_error(c, "malformed Bind param value"); return; }
+            if (i < MAX_BIND_PARAMS) {
+                size_t copy_len = (size_t)val_len < sizeof(param_strs[i]) - 1 ? (size_t)val_len : sizeof(param_strs[i]) - 1;
+                memcpy(param_strs[i], p + off, copy_len);
+                param_strs[i][copy_len] = '\0';
+                param_nulls[i] = false;
+            }
+            off += (size_t)val_len;
+        }
+    }
+
+    PreparedStatement* stmt = find_prepared_stmt(c, stmt_name);
+    if (!stmt) { wire_error(c, "prepared statement does not exist"); return; }
+
+    /* Substitute parameters ($1, $2, ... or ?) into portal's bound_query */
+    Portal* portal = alloc_portal(c, portal_name);
+    char* dst = portal->bound_query;
+    size_t dst_cap = sizeof(portal->bound_query);
+    size_t dst_len = 0;
+    const char* src = stmt->query;
+    int auto_param_idx = 0;
+
+    while (*src && dst_len + 4 < dst_cap) {
+        if (*src == '$' && is_ascii_digit(src[1])) {
+            src++;
+            int param_idx = 0;
+            while (is_ascii_digit(*src)) {
+                param_idx = param_idx * 10 + (*src - '0');
+                src++;
+            }
+            param_idx--; /* 1-based to 0-based */
+            if (param_idx >= 0 && param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
+                if (param_nulls[param_idx]) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                } else {
+                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                        if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
+                        else dst[dst_len++] = *cp;
+                    }
+                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    dst[dst_len] = '\0';
+                }
+            }
+        } else if (*src == '?') {
+            src++;
+            int param_idx = auto_param_idx++;
+            if (param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
+                if (param_nulls[param_idx]) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
+                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                } else {
+                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                        if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
+                        else dst[dst_len++] = *cp;
+                    }
+                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    dst[dst_len] = '\0';
+                }
+            }
+        } else {
+            dst[dst_len++] = *src++;
+            dst[dst_len] = '\0';
+        }
+    }
+    portal->bound_query[dst_len] = '\0';
+    pg_header(c, '2', 0); /* BindComplete */
+}
+
+static void process_pg_describe(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Describe message"); return; }
+    (void)p;
+    unsigned char nodata[5] = {'n', 0, 0, 0, 4};
+    wire_send(c, nodata, sizeof(nodata));
+}
+
+static void process_pg_execute(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 5) { wire_error(c, "malformed Execute message"); return; }
+    const char* portal_name = (const char*)p;
+    Portal* portal = find_portal(c, portal_name);
+    if (!portal) { wire_error(c, "portal does not exist"); return; }
+    execute_wire_query_internal(c, portal->bound_query, false);
+}
+
+static void process_pg_close(WireClient* c, const unsigned char* p, size_t body_len) {
+    if (body_len < 2) { wire_error(c, "malformed Close message"); return; }
+    char type = (char)p[0];
+    const char* name = (const char*)p + 1;
+    if (type == 'S') {
+        PreparedStatement* stmt = find_prepared_stmt(c, name);
+        if (stmt) memset(stmt, 0, sizeof(*stmt));
+    } else if (type == 'P') {
+        Portal* portal = find_portal(c, name);
+        if (portal) memset(portal, 0, sizeof(*portal));
+    }
+    pg_header(c, '3', 0); /* CloseComplete */
+}
+
+static void send_http_metrics(WireClient* c) {
+    AuthRateLimitStats arl_stats = auth_rate_limit_stats();
+    int active_sessions = get_active_session_count();
+    int tables = g_committed ? g_committed->table_count : 0;
+    uint64_t gen = g_generation;
+    RaftRole role = atomic_load(&g_raft_role);
+    uint32_t term = raft_get_current_term();
+
+    char body[2048];
+    int body_len = snprintf(body, sizeof(body),
+        "# HELP opendata_up Whether the server is running\n"
+        "# TYPE opendata_up gauge\n"
+        "opendata_up 1\n"
+        "# HELP opendata_active_sessions Active client network sessions\n"
+        "# TYPE opendata_active_sessions gauge\n"
+        "opendata_active_sessions %d\n"
+        "# HELP opendata_tables_total Total database tables\n"
+        "# TYPE opendata_tables_total gauge\n"
+        "opendata_tables_total %d\n"
+        "# HELP opendata_generation Database snapshot generation\n"
+        "# TYPE opendata_generation counter\n"
+        "opendata_generation %llu\n"
+        "# HELP opendata_raft_role Raft consensus role (0=Follower, 1=Candidate, 2=Leader)\n"
+        "# TYPE opendata_raft_role gauge\n"
+        "opendata_raft_role %d\n"
+        "# HELP opendata_raft_term Raft current term\n"
+        "# TYPE opendata_raft_term counter\n"
+        "opendata_raft_term %u\n"
+        "# HELP opendata_auth_admitted_total Successful authentications\n"
+        "# TYPE opendata_auth_admitted_total counter\n"
+        "opendata_auth_admitted_total %llu\n"
+        "# HELP opendata_auth_failures_total Credential authentication failures\n"
+        "# TYPE opendata_auth_failures_total counter\n"
+        "opendata_auth_failures_total %llu\n"
+        "# HELP opendata_auth_throttled_total Throttled authentication attempts\n"
+        "# TYPE opendata_auth_throttled_total counter\n"
+        "opendata_auth_throttled_total %llu\n",
+        active_sessions, tables, (unsigned long long)gen,
+        (int)role, term,
+        (unsigned long long)arl_stats.admitted,
+        (unsigned long long)arl_stats.credential_failures,
+        (unsigned long long)(arl_stats.source_throttled + arl_stats.pair_throttled + arl_stats.global_throttled));
+
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n\r\n", body_len);
+
+    wire_send(c, header, (size_t)header_len);
+    wire_send(c, body, (size_t)body_len);
+    c->closing = true;
+}
+
+static void send_http_health(WireClient* c) {
+    const char* body = "{\"status\":\"UP\",\"server\":\"" SERVER_VERSION "\"}\r\n";
+    char header[256];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n", strlen(body));
+    wire_send(c, header, (size_t)header_len);
+    wire_send(c, body, strlen(body));
+    c->closing = true;
 }
 
 static bool pg_startup(WireClient* c, const unsigned char* p, size_t length) {
@@ -687,6 +1009,20 @@ static void process_pg(WireClient* c) {
         } else if (p[0] == 'Q' && length >= 6 && p[length - 1] == 0 &&
                    memchr(p + 5, 0, length - 6) == NULL) {
             execute_wire_query(c, (const char*)p + 5);
+        } else if (p[0] == 'P') {
+            process_pg_parse(c, p + 5, length - 5);
+        } else if (p[0] == 'B') {
+            process_pg_bind(c, p + 5, length - 5);
+        } else if (p[0] == 'D') {
+            process_pg_describe(c, p + 5, length - 5);
+        } else if (p[0] == 'E') {
+            process_pg_execute(c, p + 5, length - 5);
+        } else if (p[0] == 'S') {
+            pg_ready(c);
+        } else if (p[0] == 'C') {
+            process_pg_close(c, p + 5, length - 5);
+        } else if (p[0] == 'H') {
+            /* Flush - buffered writes already handled */
         } else {
             wire_error(c, "unsupported or malformed protocol message"); c->closing = true;
         }
@@ -699,6 +1035,17 @@ static void process_pg(WireClient* c) {
 
 static void process_text(WireClient* c) {
     if (!c->authenticated) {
+        if (strncmp(c->input, "GET /metrics", 12) == 0) {
+            send_http_metrics(c);
+            return;
+        } else if (strncmp(c->input, "GET /health", 11) == 0 || strncmp(c->input, "GET / ", 6) == 0 || !strcmp(c->input, "GET /")) {
+            send_http_health(c);
+            return;
+        } else if (strncmp(c->input, "GET ", 4) == 0 || strncmp(c->input, "HEAD ", 5) == 0) {
+            wire_str(c, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            c->closing = true;
+            return;
+        }
         if (strncmp(c->input, "AUTH ", 5) != 0) {
             wire_error(c, "authentication required: AUTH <user> <password>");
             c->closing = true;
@@ -718,7 +1065,11 @@ static void process_text(WireClient* c) {
     size_t length = strlen(cmd);
     while (length && (is_sql_whitespace(cmd[length - 1]) || cmd[length - 1] == ';')) cmd[--length] = 0;
     if (!length) return;
-    if (!strcmp(cmd, "PING") || !strcmp(cmd, "ping")) wire_str(c, "PONG\r\n> ");
+    if (strncmp(cmd, "GET /metrics", 12) == 0) {
+        send_http_metrics(c);
+    } else if (strncmp(cmd, "GET /health", 11) == 0 || strncmp(cmd, "GET / ", 6) == 0 || !strcmp(cmd, "GET /")) {
+        send_http_health(c);
+    } else if (!strcmp(cmd, "PING") || !strcmp(cmd, "ping")) wire_str(c, "PONG\r\n> ");
     else if (!strcmp(cmd, "EXIT") || !strcmp(cmd, "QUIT") || !strcmp(cmd, "exit") || !strcmp(cmd, "quit")) {
         wire_str(c, "BYE\r\n"); c->closing = true;
     } else if (!strcmp(cmd, ".mode json") || !strcmp(cmd, "SET FORMAT JSON")) {
@@ -733,7 +1084,10 @@ static void process_text(WireClient* c) {
 static void receive_input(WireClient* c, const unsigned char* bytes, size_t length) {
     if (!c->detected && length) {
         c->detected = true;
-        c->pg = bytes[0] == 0;
+        c->pg = (bytes[0] == 0);
+        if (length >= 4 && (memcmp(bytes, "GET ", 4) == 0 || memcmp(bytes, "HEAD", 4) == 0)) {
+            c->authenticated = true; /* HTTP endpoints (/metrics, /health) are public scrape targets */
+        }
     }
     if (c->pg) {
         if (length >= sizeof(c->input) - c->used) {
