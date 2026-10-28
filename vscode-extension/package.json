@@ -1,0 +1,207 @@
+{
+  "name": "pc-opendata-vscode",
+  "displayName": "PC/OpenData SQL Server & Vector Studio",
+  "description": "Native VS Code extension for PC/OpenData SQL Server: .pcod/.mdf/.dbf binary editor, SIMD Vector viewer, CodeLens query runner, and engine telemetry.",
+  "version": "27.0.0",
+  "icon": "resources/Designer.png",
+  "publisher": "pc-opensystems",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Data Science",
+    "Database"
+  ],
+  "keywords": [
+    "opendata",
+    "sql",
+    "vector",
+    "embeddings",
+    "mssql",
+    "oracle"
+  ],
+  "main": "./src/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:pcopendata.databasesView",
+    "onView:pcopendata.activeSchemaView",
+    "onView:pcopendata.clusterView",
+    "onLanguage:sql",
+    "onCustomEditor:pcopendata.databaseEditor"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sql",
+        "extensions": [
+          ".sql",
+          ".pcodsql"
+        ]
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "pcopendata.databaseEditor",
+        "displayName": "PC/OpenData Database Inspector",
+        "selector": [
+          {
+            "filenamePattern": "*.pcod"
+          },
+          {
+            "filenamePattern": "*.mdf"
+          },
+          {
+            "filenamePattern": "*.ndf"
+          },
+          {
+            "filenamePattern": "*.dbf"
+          },
+          {
+            "filenamePattern": "*.ora"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pcopendata-explorer",
+          "title": "PC/OpenData",
+          "icon": "resources/Designer.png"
+        }
+      ]
+    },
+    "views": {
+      "pcopendata-explorer": [
+        {
+          "id": "pcopendata.databasesView",
+          "name": "Database Snapshots & Files"
+        },
+        {
+          "id": "pcopendata.activeSchemaView",
+          "name": "Schema Explorer & Vectors"
+        },
+        {
+          "id": "pcopendata.clusterView",
+          "name": "Raft Consensus & Quorum"
+        }
+      ]
+    },
+    "walkthroughs": [
+      {
+        "id": "pcopendata.gettingStarted",
+        "title": "Get Started with PC/OpenData",
+        "description": "Open a database, run your first query, and explore your schema — no database experience needed.",
+        "steps": [
+          {
+            "id": "pcopendata.openDatabase",
+            "title": "Open or create a database",
+            "description": "[Open the getting-started database](command:pcopendata.openGettingStartedDatabase)\n[Learn more](command:pcopendata.showWalkthroughDoc?%5B%22open-database%22%5D)",
+            "media": { "markdown": "walkthrough/open-database.md" },
+            "completionEvents": ["onCommand:pcopendata.openGettingStartedDatabase"]
+          },
+          {
+            "id": "pcopendata.firstQuery",
+            "title": "Run your first query",
+            "description": "Create `scratch.sql`, paste `LOAD SAMPLE;` and `SELECT * FROM SAMPLE_DATA;`, then click **▶ Run Statement**.\n[Learn more](command:pcopendata.showWalkthroughDoc?%5B%22first-query%22%5D)",
+            "media": { "markdown": "walkthrough/first-query.md" },
+            "completionEvents": ["onCommand:pcopendata.runStatement"]
+          },
+          {
+            "id": "pcopendata.exploreSchema",
+            "title": "Explore your schema",
+            "description": "Open the PC/OpenData Activity Bar view for snapshots, schema, and cluster health.\n[Learn more](command:pcopendata.showWalkthroughDoc?%5B%22explore-schema%22%5D)",
+            "media": { "markdown": "walkthrough/explore-schema.md" },
+            "completionEvents": ["onView:pcopendata.activeSchemaView"]
+          },
+          {
+            "id": "pcopendata.nextSteps",
+            "title": "Next steps",
+            "description": "Guided CSV import, verified backups, and secure network sharing.\n[Learn more](command:pcopendata.showWalkthroughDoc?%5B%22next-steps%22%5D)",
+            "media": { "markdown": "walkthrough/next-steps.md" }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "pcopendata.gettingStarted",
+        "title": "Open Getting Started Walkthrough",
+        "category": "PC/OpenData",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "pcopendata.openGettingStartedDatabase",
+        "title": "Open Getting Started Database",
+        "category": "PC/OpenData",
+        "icon": "$(database)"
+      },
+      {
+        "command": "pcopendata.runStatement",
+        "title": "Run SQL Statement",
+        "category": "PC/OpenData",
+        "icon": "$(play)"
+      },
+      {
+        "command": "pcopendata.benchmarkStatement",
+        "title": "Benchmark Statement (100x)",
+        "category": "PC/OpenData",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "pcopendata.explainStatement",
+        "title": "Explain Query Plan (CBO)",
+        "category": "PC/OpenData",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "pcopendata.showEngineStatus",
+        "title": "Show Engine & Buffer Pool Telemetry",
+        "category": "PC/OpenData",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "pcopendata.diffSchema",
+        "title": "Compare Schema with Database File...",
+        "category": "PC/OpenData"
+      },
+      {
+        "command": "pcopendata.dumpDatabase",
+        "title": "Export / Dump Full SQL Script",
+        "category": "PC/OpenData"
+      },
+      {
+        "command": "pcopendata.startAsyncServer",
+        "title": "Start Background PGv3 Async Server",
+        "category": "PC/OpenData"
+      },
+      {
+        "command": "pcopendata.stopAsyncServer",
+        "title": "Stop Background PGv3 Async Server",
+        "category": "PC/OpenData"
+      }
+    ],
+    "configuration": {
+      "title": "PC/OpenData",
+      "properties": {
+        "pcopendata.executablePath": {
+          "type": "string",
+          "default": "${workspaceFolder}/bin/opendata.exe",
+          "description": "Path to the opendata.exe engine executable."
+        },
+        "pcopendata.serverPort": {
+          "type": "number",
+          "default": 7350,
+          "description": "TCP/PGv3 wire protocol server port."
+        },
+        "pcopendata.autocommit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically commit write operations."
+        }
+      }
+    }
+  }
+}

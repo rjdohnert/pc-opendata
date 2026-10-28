@@ -1,0 +1,353 @@
+#include "database_engine.h"
+
+static bool has_extension_ci(const char* path, const char* ext) {
+    if (!path || !ext) return false;
+    size_t plen = strlen(path);
+    size_t elen = strlen(ext);
+    if (plen < elen) return false;
+    const char* tail = path + (plen - elen);
+    for (size_t i = 0; i < elen; i++) {
+        if (uppercase_ascii(tail[i]) != uppercase_ascii(ext[i])) return false;
+    }
+    return true;
+}
+
+static const char* select_snapshot_magic(const char* path) {
+    if (has_extension_ci(path, ".mdf") || has_extension_ci(path, ".ndf") ||
+        has_extension_ci(path, ".ldf") || has_extension_ci(path, ".bak")) {
+        return "MSQLMDF1";
+    }
+    if (has_extension_ci(path, ".dbf") || has_extension_ci(path, ".ora") ||
+        has_extension_ci(path, ".dmp") || has_extension_ci(path, ".ctl")) {
+        return "ORCLDBF1";
+    }
+    return "PCOD0001";
+}
+
+static bool append_snapshot_bytes(Image* image, const void* data, size_t size) {
+    if (!image->ok || size > MAX_IMAGE || image->size > MAX_IMAGE - size) return image->ok = false;
+    if (image->size + size > image->capacity) {
+        size_t capacity = image->capacity ? image->capacity : 4096;
+        while (capacity < image->size + size) capacity *= 2;
+        unsigned char* bytes = realloc(image->data, capacity);
+        if (!bytes) return image->ok = false;
+        image->data = bytes; image->capacity = capacity;
+    }
+    memcpy(image->data + image->size, data, size);
+    image->size += size; return true;
+}
+static void encode_u32(Image* image, uint32_t value) {
+    unsigned char bytes[4];
+    for (unsigned i = 0; i < 4; i++) bytes[i] = (unsigned char)(value >> (i * 8));
+    append_snapshot_bytes(image, bytes, 4);
+}
+static void encode_u64(Image* image, uint64_t value) {
+    encode_u32(image, (uint32_t)value); encode_u32(image, (uint32_t)(value >> 32));
+}
+static void encode_text(Image* image, const char* text) {
+    size_t length = strlen(text);
+    encode_u32(image, (uint32_t)length); append_snapshot_bytes(image, text, length);
+}
+static bool decode_snapshot_bytes(Image* image, void* dest, size_t size) {
+    if (!image->ok || image->offset > image->size || size > image->size - image->offset)
+        return image->ok = false;
+    memcpy(dest, image->data + image->offset, size);
+    image->offset += size; return true;
+}
+static uint32_t decode_u32(Image* image) {
+    unsigned char b[4] = {0};
+    decode_snapshot_bytes(image, b, 4);
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static uint64_t decode_u64(Image* image) {
+    uint64_t low = decode_u32(image), high = decode_u32(image);
+    return low | (high << 32);
+}
+static bool decode_text(Image* image, char* text, size_t capacity) {
+    uint32_t length = decode_u32(image);
+    if (!image->ok || length >= capacity || !decode_snapshot_bytes(image, text, length))
+        return image->ok = false;
+    text[length] = '\0';
+    if (strlen(text) != length) return image->ok = false;
+    return true;
+}
+static uint32_t calculate_crc32(const unsigned char* bytes, size_t size) {
+    uint32_t crc = UINT32_MAX;
+    for (size_t i = 0; i < size; i++) {
+        crc ^= bytes[i];
+        for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+bool encode_database_snapshot(const Database* db, uint64_t identity, uint64_t generation, Image* image) {
+    memset(image, 0, sizeof(*image)); image->ok = true;
+    append_snapshot_bytes(image, select_snapshot_magic(g_path), 8);
+    encode_u64(image, identity); encode_u64(image, generation);
+    encode_u32(image, (uint32_t)db->table_count);
+    for (int t = 0; t < db->table_count; t++) {
+        const Table* table = &db->tables[t];
+        encode_text(image, table->name);
+        encode_u32(image, (uint32_t)table->col_count); encode_u32(image, (uint32_t)table->row_count);
+        for (int c = 0; c < table->col_count; c++) {
+            const ColumnDef* column = &table->columns[c];
+            encode_text(image, column->name); encode_u32(image, (uint32_t)column->type);
+            encode_u32(image, (uint32_t)column->size);
+            encode_u32(image, (column->nullable ? 1u : 0u) | (column->unique ? 2u : 0u) | (column->primary ? 4u : 0u));
+            encode_text(image, column->ref_table); encode_text(image, column->ref_column);
+            encode_u32(image, (uint32_t)column->fk_on_delete);
+            encode_u32(image, (uint32_t)column->fk_on_update);
+            encode_text(image, column->constraint_name);
+        }
+        /* Composite primary key and unique constraints. */
+        encode_u32(image, (uint32_t)table->pk_col_count);
+        for (int k = 0; k < table->pk_col_count; k++) encode_u32(image, (uint32_t)table->pk_cols[k]);
+        encode_text(image, table->pk_name);
+        encode_u32(image, (uint32_t)table->uq_count);
+        for (int u = 0; u < table->uq_count; u++) {
+            encode_u32(image, (uint32_t)table->uq_col_counts[u]);
+            for (int k = 0; k < table->uq_col_counts[u]; k++) encode_u32(image, (uint32_t)table->uq_cols[u][k]);
+            encode_text(image, table->uq_names[u]);
+        }
+        for (int r = 0; r < table->row_count; r++)
+            for (int c = 0; c < table->col_count; c++) {
+                const Value* value = &table->rows[r].values[c];
+                encode_u32(image, value->is_null ? 1u : 0u);
+                encode_text(image, value->is_null ? "" : value->text);
+            }
+    }
+    if (image->ok) {
+        append_snapshot_bytes(image, "USRCAT01", 8);
+        encode_u32(image, (uint32_t)db->user_count);
+        for (int i = 0; i < db->user_count; i++) {
+            const UserAccount* user = &db->users[i];
+            encode_text(image, user->name);
+            append_snapshot_bytes(image, user->salt, sizeof(user->salt));
+            append_snapshot_bytes(image, user->verifier, sizeof(user->verifier));
+            encode_u32(image, user->kdf_id);
+            encode_u32(image, user->iterations);
+            encode_u32(image, (uint32_t)user->role);
+            encode_u32(image, user->disabled ? 1u : 0u);
+        }
+    }
+    /* Secondary indexes are part of the durable schema. */
+    if (image->ok) {
+        append_snapshot_bytes(image, "SECIDX01", 8);
+        encode_u32(image, (uint32_t)db->index_count);
+        for (int i = 0; i < db->index_count; i++) {
+            const SecondaryIndex* idx = &db->indexes[i];
+            encode_text(image, idx->name);
+            encode_text(image, idx->table_name);
+            encode_u32(image, (uint32_t)idx->col_idx);
+            encode_u32(image, idx->is_unique ? 1u : 0u);
+        }
+    }
+    /* Per-table grants (optional section; older snapshots have none). */
+    if (image->ok) {
+        append_snapshot_bytes(image, "TGRANT01", 8);
+        encode_u32(image, (uint32_t)db->grant_count);
+        for (int i = 0; i < db->grant_count; i++) {
+            encode_text(image, db->grants[i].user);
+            encode_text(image, db->grants[i].table);
+            encode_u32(image, db->grants[i].privileges);
+        }
+    }
+    if (image->ok) encode_u32(image, calculate_crc32(image->data, image->size));
+    return image->ok;
+}
+
+Database* decode_database_snapshot(Image* image, uint64_t* identity, uint64_t* generation) {
+    if (image->size < 32) return NULL;
+    if (memcmp(image->data, "PCOD0001", 8) != 0 &&
+        memcmp(image->data, "MSQLMDF1", 8) != 0 &&
+        memcmp(image->data, "ORCLDBF1", 8) != 0) {
+        return NULL;
+    }
+    image->offset = image->size - 4; image->ok = true;
+    uint32_t stored_crc = decode_u32(image);
+    if (stored_crc != calculate_crc32(image->data, image->size - 4)) return NULL;
+    image->offset = 8;
+    *identity = decode_u64(image); *generation = decode_u64(image);
+    uint32_t tables = decode_u32(image);
+    if (!*identity || tables > MAX_TABLES) return NULL;
+    Database* db = calloc(1, sizeof(*db));
+    if (!db) return NULL;
+    uint32_t total_rows = 0;
+    for (uint32_t t = 0; t < tables && image->ok; t++) {
+        Table* table = &db->tables[t];
+        db->table_count++;
+        decode_text(image, table->name, sizeof(table->name));
+        uint32_t columns = decode_u32(image), rows = decode_u32(image);
+        if (columns < 1 || columns > MAX_COLUMNS || rows > MAX_ROWS ||
+            rows > (uint32_t)MAX_TOTAL_ROWS - total_rows) { image->ok = false; break; }
+        total_rows += rows;
+        table->col_count = (int)columns;
+        for (int c = 0; c < table->col_count && image->ok; c++) {
+            ColumnDef* col = &table->columns[c];
+            decode_text(image, col->name, sizeof(col->name));
+            uint32_t type = decode_u32(image), size = decode_u32(image), flags = decode_u32(image);
+            if (type > TYPE_VECTOR || size < 1 || size >= MAX_VAL_LEN || flags > 7) { image->ok = false; break; }
+            col->type = (DataType)type; col->size = (int)size;
+            col->nullable = (flags & 1) != 0; col->unique = (flags & 2) != 0; col->primary = (flags & 4) != 0;
+            if (col->primary && table->pk_col_count < MAX_COLUMNS) {
+                table->pk_cols[table->pk_col_count++] = c;
+            }
+            decode_text(image, col->ref_table, sizeof(col->ref_table));
+            decode_text(image, col->ref_column, sizeof(col->ref_column));
+            uint32_t fk_del = decode_u32(image), fk_upd = decode_u32(image);
+            if (fk_del > FK_ACTION_SET_NULL || fk_upd > FK_ACTION_SET_NULL) { image->ok = false; break; }
+            col->fk_on_delete = (ForeignKeyAction)fk_del;
+            col->fk_on_update = (ForeignKeyAction)fk_upd;
+            decode_text(image, col->constraint_name, sizeof(col->constraint_name));
+        }
+        if (!image->ok) break;
+        /* Composite primary key and unique constraints. */
+        {
+            uint32_t pk_count = decode_u32(image);
+            if (pk_count > MAX_COLUMNS) { image->ok = false; break; }
+            table->pk_col_count = 0;
+            for (uint32_t k = 0; k < pk_count && image->ok; k++) {
+                uint32_t ci = decode_u32(image);
+                if (ci >= (uint32_t)table->col_count) { image->ok = false; break; }
+                bool dup = false;
+                for (int j = 0; j < table->pk_col_count; j++) if (table->pk_cols[j] == (int)ci) dup = true;
+                if (dup) { image->ok = false; break; }
+                table->pk_cols[table->pk_col_count++] = (int)ci;
+            }
+            if (!decode_text(image, table->pk_name, sizeof(table->pk_name))) break;
+            uint32_t uq_count = decode_u32(image);
+            if (uq_count > MAX_COLUMNS) { image->ok = false; break; }
+            table->uq_count = 0;
+            for (uint32_t u = 0; u < uq_count && image->ok; u++) {
+                uint32_t cnt = decode_u32(image);
+                if (cnt > MAX_COLUMNS) { image->ok = false; break; }
+                table->uq_col_counts[u] = 0;
+                for (uint32_t k = 0; k < cnt && image->ok; k++) {
+                    uint32_t ci = decode_u32(image);
+                    if (ci >= (uint32_t)table->col_count) { image->ok = false; break; }
+                    bool dup = false;
+                    for (int j = 0; j < table->uq_col_counts[u]; j++) if (table->uq_cols[u][j] == (int)ci) dup = true;
+                    if (dup) { image->ok = false; break; }
+                    table->uq_cols[u][table->uq_col_counts[u]++] = (int)ci;
+                }
+                if (!decode_text(image, table->uq_names[u], sizeof(table->uq_names[u]))) break;
+                table->uq_count++;
+            }
+            if (!image->ok) break;
+        }
+        if ((size_t)rows * columns * 8 > image->size - image->offset) { image->ok = false; break; }
+        if (rows) {
+            if (!allocate_table_storage(table, (int)rows)) { image->ok = false; break; }
+            table->row_count = (int)rows;
+        }
+        for (int r = 0; r < table->row_count && image->ok; r++)
+            for (int c = 0; c < table->col_count && image->ok; c++) {
+                Value* value = &table->rows[r].values[c];
+                uint32_t flag = decode_u32(image);
+                if (flag > 1) { image->ok = false; break; }
+                value->is_null = flag == 1;
+                decode_text(image, value->text, sizeof(value->text));
+                if (value->is_null && value->text[0]) image->ok = false;
+            }
+    }
+    if (image->ok && image->offset < image->size - 4) {
+        unsigned char marker[8];
+        if (!decode_snapshot_bytes(image, marker, sizeof(marker)) ||
+            memcmp(marker, "USRCAT01", sizeof(marker)) != 0) {
+            image->ok = false;
+        } else {
+            uint32_t users = decode_u32(image);
+            if (users > MAX_USERS) image->ok = false;
+            for (uint32_t i = 0; i < users && image->ok; i++) {
+                UserAccount* account = &db->users[i];
+                db->user_count++;
+                decode_text(image, account->name, sizeof(account->name));
+                decode_snapshot_bytes(image, account->salt, sizeof(account->salt));
+                decode_snapshot_bytes(image, account->verifier, sizeof(account->verifier));
+                account->kdf_id = decode_u32(image);
+                account->iterations = decode_u32(image);
+                uint32_t role = decode_u32(image);
+                uint32_t disabled = decode_u32(image);
+                if (!validate_user_name(account->name) ||
+                    account->kdf_id != USER_KDF_PBKDF2_SHA256 ||
+                    account->iterations < 10000u || account->iterations > 10000000u ||
+                    (role != USER_ROLE_ADMIN && role != USER_ROLE_READ_ONLY) || disabled > 1) {
+                    image->ok = false;
+                    break;
+                }
+                account->role = (UserRole)role;
+                account->disabled = disabled != 0;
+                for (uint32_t j = 0; j < i; j++) {
+                    if (strcmp(db->users[j].name, account->name) == 0) image->ok = false;
+                }
+            }
+        }
+    }
+    /* Secondary indexes (optional section for backward compatibility). */
+    if (image->ok && image->offset < image->size - 4) {
+        unsigned char marker[8];
+        if (!decode_snapshot_bytes(image, marker, sizeof(marker)) ||
+            memcmp(marker, "SECIDX01", sizeof(marker)) != 0) {
+            image->ok = false;
+        } else {
+            uint32_t indexes = decode_u32(image);
+            if (indexes > MAX_SECONDARY_INDEXES) image->ok = false;
+            for (uint32_t i = 0; i < indexes && image->ok; i++) {
+                char idx_name[MAX_NAME_LEN], tbl_name[MAX_NAME_LEN];
+                if (!decode_text(image, idx_name, sizeof(idx_name)) ||
+                    !decode_text(image, tbl_name, sizeof(tbl_name))) break;
+                uint32_t col_idx = decode_u32(image);
+                uint32_t is_unique = decode_u32(image);
+                if (is_unique > 1) { image->ok = false; break; }
+                int t_idx = find_table_index(db, tbl_name);
+                if (t_idx < 0 || col_idx >= (uint32_t)db->tables[t_idx].col_count) {
+                    image->ok = false;
+                    break;
+                }
+                if (!execute_create_index_in_db(db, idx_name, tbl_name,
+                                                db->tables[t_idx].columns[col_idx].name,
+                                                is_unique != 0)) {
+                    image->ok = false;
+                    break;
+                }
+            }
+        }
+    }
+    /* Per-table grants (optional section for backward compatibility). */
+    if (image->ok && image->offset < image->size - 4) {
+        unsigned char marker[8];
+        if (!decode_snapshot_bytes(image, marker, sizeof(marker)) ||
+            memcmp(marker, "TGRANT01", sizeof(marker)) != 0) {
+            image->ok = false;
+        } else {
+            uint32_t grants = decode_u32(image);
+            if (grants > MAX_GRANTS) image->ok = false;
+            for (uint32_t i = 0; i < grants && image->ok; i++) {
+                TableGrant* grant = &db->grants[db->grant_count];
+                if (!decode_text(image, grant->user, sizeof(grant->user)) ||
+                    !decode_text(image, grant->table, sizeof(grant->table))) break;
+                uint32_t privileges = decode_u32(image);
+                if (!image->ok) break;
+                if (!validate_user_name(grant->user) ||
+                    !is_valid_identifier(grant->table) ||
+                    privileges == 0 || privileges > 15u ||
+                    find_user_index(db, grant->user) < 0 ||
+                    find_table_index(db, grant->table) < 0) {
+                    image->ok = false;
+                    break;
+                }
+                for (uint32_t j = 0; j < i; j++) {
+                    if (!strcmp(db->grants[j].user, grant->user) &&
+                        !strcmp(db->grants[j].table, grant->table)) image->ok = false;
+                }
+                if (!image->ok) break;
+                grant->privileges = privileges;
+                db->grant_count++;
+            }
+        }
+    }
+    if (!image->ok || image->offset != image->size - 4 || !validate_relational_integrity(db)) {
+        destroy_database(db); return NULL;
+    }
+    return db;
+}
