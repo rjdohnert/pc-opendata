@@ -382,31 +382,39 @@ static void emit_tuples(
         int* candidate_rows = NULL;
         int candidate_count = 0;
         bool used_secondary_index = false;
+        const Table* t0 = scope->tables[0];
+        bool has_parts = (t0->part_type != PART_NONE && t0->part_count > 0);
+        uint32_t part_mask = has_parts ? prune_partitions_for_filter(t0, 0, filter) : 0xFFFFFFFFu;
+        if (has_parts && part_mask == 0) return;
 
-        if (scope->count == 1 && g_db && filter && filter->node_count == 1 && filter->nodes[filter->root].type == FILTER_NODE_PRED) {
-            const Predicate* pred = &filter->nodes[filter->root].pred;
-            if (!pred->right_column && pred->left.table == 0) {
-                int sec_idx = find_secondary_index(g_db, scope->tables[0]->name, pred->left.column);
-                if (sec_idx >= 0 && g_db->indexes[sec_idx].entry_count > 0) {
-                    candidate_rows = (int*)malloc((size_t)g_db->indexes[sec_idx].entry_count * sizeof(int));
-                    if (candidate_rows) {
-                        DataType col_type = scope->tables[0]->columns[pred->left.column].type;
-                        if (pred->op == TK_EQ) {
-                            candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, &pred->value, candidate_rows, g_db->indexes[sec_idx].entry_count);
-                            used_secondary_index = true;
-                        } else if (pred->op == PRED_BETWEEN) {
-                            candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, &pred->value2, candidate_rows, g_db->indexes[sec_idx].entry_count);
-                            used_secondary_index = true;
-                        } else if (pred->op == TK_GT || pred->op == TK_GE) {
-                            candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, NULL, candidate_rows, g_db->indexes[sec_idx].entry_count);
-                            used_secondary_index = true;
-                        } else if (pred->op == TK_LT || pred->op == TK_LE) {
-                            candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, NULL, &pred->value, candidate_rows, g_db->indexes[sec_idx].entry_count);
-                            used_secondary_index = true;
-                        } else {
-                            free(candidate_rows);
-                            candidate_rows = NULL;
-                        }
+        bool cbo_use_idx = false;
+        int sec_idx = -1;
+        int est_rows = 0;
+        cbo_estimate_query_cost(g_db, t0, 0, filter, &cbo_use_idx, &sec_idx, &est_rows);
+
+        if (cbo_use_idx && sec_idx >= 0 && g_db && g_db->indexes[sec_idx].entry_count > 0) {
+            const FilterNode* root = &filter->nodes[filter->root];
+            const Predicate* pred = (root->type == FILTER_NODE_PRED) ? &root->pred :
+                ((root->type == FILTER_NODE_AND && root->left_child >= 0) ? &filter->nodes[root->left_child].pred : NULL);
+            if (pred && !pred->right_column && pred->left.table == 0) {
+                candidate_rows = (int*)malloc((size_t)g_db->indexes[sec_idx].entry_count * sizeof(int));
+                if (candidate_rows) {
+                    DataType col_type = t0->columns[pred->left.column].type;
+                    if (pred->op == TK_EQ) {
+                        candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, &pred->value, candidate_rows, g_db->indexes[sec_idx].entry_count);
+                        used_secondary_index = true;
+                    } else if (pred->op == PRED_BETWEEN) {
+                        candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, &pred->value2, candidate_rows, g_db->indexes[sec_idx].entry_count);
+                        used_secondary_index = true;
+                    } else if (pred->op == TK_GT || pred->op == TK_GE) {
+                        candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, &pred->value, NULL, candidate_rows, g_db->indexes[sec_idx].entry_count);
+                        used_secondary_index = true;
+                    } else if (pred->op == TK_LT || pred->op == TK_LE) {
+                        candidate_count = secondary_index_find_range(&g_db->indexes[sec_idx], col_type, NULL, &pred->value, candidate_rows, g_db->indexes[sec_idx].entry_count);
+                        used_secondary_index = true;
+                    } else {
+                        free(candidate_rows);
+                        candidate_rows = NULL;
                     }
                 }
             }
@@ -414,7 +422,12 @@ static void emit_tuples(
 
         if (used_secondary_index && candidate_rows) {
             for (int k = 0; k < candidate_count; k++) {
-                current_tuple[0] = candidate_rows[k];
+                int r_idx = candidate_rows[k];
+                if (has_parts) {
+                    int p = get_row_partition(t0, &t0->rows[r_idx]);
+                    if (p < 0 || !(part_mask & (1u << (unsigned)p))) continue;
+                }
+                current_tuple[0] = r_idx;
                 emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
                 if (*selected >= MAX_RESULTS || *work_limit_reached) break;
             }
@@ -423,7 +436,11 @@ static void emit_tuples(
         }
         if (candidate_rows) free(candidate_rows);
 
-        for (int r0 = 0; r0 < scope->tables[0]->row_count; r0++) {
+        for (int r0 = 0; r0 < t0->row_count; r0++) {
+            if (has_parts) {
+                int p = get_row_partition(t0, &t0->rows[r0]);
+                if (p < 0 || !(part_mask & (1u << (unsigned)p))) continue;
+            }
             current_tuple[0] = r0;
             emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
             if (*selected >= MAX_RESULTS || *work_limit_reached) return;

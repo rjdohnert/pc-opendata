@@ -102,6 +102,13 @@ bool commit_transaction(void) {
     if (atomic_load(&g_backup_failed)) return report_database_error("backup unhealthy; run BACKUP before committing");
     if (!g_pending) { puts("Commit complete. No pending changes."); return true; }
     if (g_generation == UINT64_MAX) return report_database_error("generation exhausted");
+    for (int t = 0; t < g_db->table_count; t++) {
+        Table* tbl = &g_db->tables[t];
+        if ((tbl->dead_row_count >= 64 && tbl->dead_row_count > tbl->row_count / 2) ||
+            (tbl->capacity >= 64 && tbl->capacity > tbl->row_count * 4)) {
+            vacuum_table_storage(g_db, t, false, NULL, NULL);
+        }
+    }
     Database* committed = copy_database(g_db);
     if (!committed) return report_database_error("cannot allocate committed state");
     Image image, previous_image;

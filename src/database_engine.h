@@ -106,12 +106,15 @@ typedef struct {
 } ColumnDef;
 typedef struct { Value values[MAX_COLUMNS]; } Row;
 
+#define CBO_HISTOGRAM_BUCKETS 8
+
 typedef struct {
    int null_count;
    int distinct_count;
    long double min_numeric;
    long double max_numeric;
    bool has_numeric_bounds;
+   int histogram[CBO_HISTOGRAM_BUCKETS];
 } ColumnStats;
 
 typedef struct {
@@ -128,7 +131,21 @@ struct RowStorage {
    Row* rows;
 };
 
-typedef enum { ENGINE_MEMORY = 0, ENGINE_DISK = 1 } StorageEngineType;
+typedef enum { ENGINE_MEMORY = 0, ENGINE_DISK = 1, ENGINE_COLUMNAR = 2 } StorageEngineType;
+
+typedef enum {
+   PART_NONE = 0,
+   PART_HASH = 1,
+   PART_RANGE = 2
+} PartitionType;
+
+#define MAX_PARTITIONS 8
+
+typedef struct {
+   char name[MAX_NAME_LEN];
+   char upper_bound[64];
+   bool is_maxvalue;
+} PartitionDef;
 
 typedef struct {
    char name[MAX_NAME_LEN];
@@ -147,6 +164,15 @@ typedef struct {
    char uq_names[MAX_COLUMNS][MAX_NAME_LEN];
    int uq_count;
    TableStats stats;
+   /* Multi-Version Garbage Collection (Vacuum) tracking */
+   int dead_row_count;
+   uint64_t last_vacuum_gen;
+   uint64_t total_vacuumed_rows;
+   /* Table Partitioning (HASH / RANGE) */
+   PartitionType part_type;
+   int part_col_idx;
+   int part_count;
+   PartitionDef partitions[MAX_PARTITIONS];
 } Table;
 
 #define MAX_SECONDARY_INDEXES 32
@@ -701,9 +727,20 @@ int secondary_index_find_range(const SecondaryIndex* idx, DataType type, const V
 bool execute_analyze_table(const char* table_name);
 bool execute_analyze_all(void);
 void print_table_stats(const char* table_name);
+double cbo_estimate_predicate_selectivity(const Table* tbl, const Predicate* pred);
+double cbo_estimate_filter_selectivity(const Table* tbl, int table_scope_idx, const Filter* filter);
+double cbo_estimate_query_cost(const Database* db, const Table* tbl, int table_scope_idx, const Filter* filter, bool* out_use_index, int* out_index_id, int* out_est_rows);
 
-/* Vectorized Columnar Engine */
+/* Multi-Version Garbage Collection (MVCC Vacuum) */
+bool vacuum_table_storage(Database* db, int table_idx, bool full, size_t* out_freed_bytes, int* out_reclaimed_versions);
+bool execute_vacuum_command(const char* table_name, bool full, bool analyze);
+bool opendata_vacuum(const char* table_name);
+
+/* Partitioning & Vectorized Columnar Spillover Engine */
+int get_row_partition(const Table* tbl, const Row* row);
+uint32_t prune_partitions_for_filter(const Table* tbl, int table_scope_idx, const Filter* filter);
 void vector_aggregate_numeric(const Table* table, int col_idx, const Filter* filter, long double* out_sum, long double* out_min, long double* out_max, int* out_count);
+void vector_aggregate_numeric_partitioned(const Table* table, int col_idx, const Filter* filter, uint32_t active_part_mask, long double* out_sum, long double* out_min, long double* out_max, int* out_count);
 
 /* Non-blocking Async Event-Multiplexed Wire Server */
 bool run_nonblocking_wire_server(const ServerConfig* config);

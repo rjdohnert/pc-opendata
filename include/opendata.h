@@ -61,6 +61,11 @@ bool opendata_release_savepoint(const char* name);
 bool opendata_backup(void);
 
 /*
+ * Run Multi-Version Garbage Collection (VACUUM) on a specific table (or all tables if table_name is NULL).
+ */
+bool opendata_vacuum(const char* table_name);
+
+/*
  * Return the current durable database generation number.
  */
 uint64_t opendata_get_generation(void);

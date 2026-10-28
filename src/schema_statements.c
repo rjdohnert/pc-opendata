@@ -220,16 +220,81 @@ bool execute_create_table(Parser* p, Database* db) {
     } while (consume_token(p, TK_COMMA));
     if (!consume_token(p, TK_RP)) return false;
     table->engine_type = ENGINE_MEMORY;
-    if (consume_keyword(p, "ENGINE")) {
-        consume_token(p, TK_EQ);
-        if (consume_keyword(p, "DISK")) {
-            table->engine_type = ENGINE_DISK;
-            table->btree_root_page = 0;
-            table->first_data_page = 1;
-        } else if (consume_keyword(p, "MEMORY")) {
-            table->engine_type = ENGINE_MEMORY;
-        } else {
-            return report_database_error("unknown storage engine");
+    table->part_type = PART_NONE;
+    for (int opt_iter = 0; opt_iter < 2; opt_iter++) {
+        if (consume_keyword(p, "ENGINE")) {
+            consume_token(p, TK_EQ);
+            if (consume_keyword(p, "DISK")) {
+                table->engine_type = ENGINE_DISK;
+                table->btree_root_page = 0;
+                table->first_data_page = 1;
+            } else if (consume_keyword(p, "COLUMNAR")) {
+                table->engine_type = ENGINE_COLUMNAR;
+            } else if (consume_keyword(p, "MEMORY")) {
+                table->engine_type = ENGINE_MEMORY;
+            } else {
+                return report_database_error("unknown storage engine");
+            }
+        } else if (consume_keyword(p, "PARTITION")) {
+            if (!consume_keyword(p, "BY")) return false;
+            if (consume_keyword(p, "HASH")) {
+                if (!consume_token(p, TK_LP)) return false;
+                char pcol[MAX_NAME_LEN];
+                if (!parse_identifier(p, pcol) || !consume_token(p, TK_RP)) return false;
+                int pci = find_column_index(table, pcol);
+                if (pci < 0) return report_database_error("partition column not found: %s", pcol);
+                int pcnt = 4;
+                if (consume_keyword(p, "PARTITIONS")) {
+                    if (p->kind != TK_NUMBER) return false;
+                    pcnt = (int)strtol(p->text, NULL, 10);
+                    scan_next_token(p);
+                }
+                if (pcnt < 1 || pcnt > MAX_PARTITIONS) {
+                    return report_database_error("partition count must be between 1 and %d", MAX_PARTITIONS);
+                }
+                table->part_type = PART_HASH;
+                table->part_col_idx = pci;
+                table->part_count = pcnt;
+                for (int pi = 0; pi < pcnt; pi++) {
+                    snprintf(table->partitions[pi].name, sizeof(table->partitions[pi].name), "P%d", pi);
+                }
+            } else if (consume_keyword(p, "RANGE")) {
+                if (!consume_token(p, TK_LP)) return false;
+                char pcol[MAX_NAME_LEN];
+                if (!parse_identifier(p, pcol) || !consume_token(p, TK_RP)) return false;
+                int pci = find_column_index(table, pcol);
+                if (pci < 0) return report_database_error("partition column not found: %s", pcol);
+                if (!consume_token(p, TK_LP)) return false;
+                table->part_type = PART_RANGE;
+                table->part_col_idx = pci;
+                table->part_count = 0;
+                do {
+                    if (table->part_count >= MAX_PARTITIONS) {
+                        return report_database_error("maximum range partitions (%d) exceeded", MAX_PARTITIONS);
+                    }
+                    if (!consume_keyword(p, "PARTITION")) return false;
+                    PartitionDef* pd = &table->partitions[table->part_count];
+                    memset(pd, 0, sizeof(*pd));
+                    if (!parse_identifier(p, pd->name)) return false;
+                    if (!consume_keyword(p, "VALUES") || !consume_keyword(p, "LESS") ||
+                        !consume_keyword(p, "THAN") || !consume_token(p, TK_LP)) return false;
+                    if (consume_keyword(p, "MAXVALUE")) {
+                        pd->is_maxvalue = true;
+                        snprintf(pd->upper_bound, sizeof(pd->upper_bound), "MAXVALUE");
+                    } else {
+                        Value bound_val = {0};
+                        if (!parse_typed_literal(p, &table->columns[pci], &bound_val) || bound_val.is_null) {
+                            return report_database_error("invalid range partition upper bound for %s", pd->name);
+                        }
+                        snprintf(pd->upper_bound, sizeof(pd->upper_bound), "%.63s", bound_val.text);
+                    }
+                    if (!consume_token(p, TK_RP)) return false;
+                    table->part_count++;
+                } while (consume_token(p, TK_COMMA));
+                if (!consume_token(p, TK_RP)) return false;
+            } else {
+                return report_database_error("expected HASH or RANGE after PARTITION BY");
+            }
         }
     }
     if (!consume_statement_end(p)) return false;

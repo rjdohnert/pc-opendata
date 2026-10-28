@@ -292,6 +292,64 @@ class EnterpriseReadinessTests(unittest.TestCase):
         self.assertIn("opendata_database_generation", res.stdout)
         self.assertIn("opendata_raft_role", res.stdout)
 
+    def test_mvcc_vacuum_and_dead_row_reclamation(self):
+        """Test Evolution 1: Multi-Version Garbage Collection (VACUUM FULL ANALYZE)."""
+        res = self.run_sql(
+            "CREATE TABLE items (id NUMBER PRIMARY KEY, val NUMBER);",
+            "INSERT INTO items VALUES (1, 10), (2, 20), (3, 30), (4, 40);",
+            "UPDATE items SET val = 99 WHERE id <= 3;",
+            "DELETE FROM items WHERE id = 4;",
+            "SHOW ENGINE STATUS;",
+            "VACUUM FULL ANALYZE items;",
+            "SHOW ENGINE STATUS;",
+            "COMMIT;"
+        )
+        self.assertIn("MVCC_DEAD_ROW_VERSIONS\t4", res.stdout)
+        self.assertIn("reclaimed 4 dead MVCC row versions", res.stdout)
+        self.assertIn("MVCC_DEAD_ROW_VERSIONS\t0 (reclaimed total: 4)", res.stdout)
+
+    def test_cbo_histogram_and_explain_cost_plan(self):
+        """Test Evolution 2: Cost-Based Query Optimizer (CBO) histograms and EXPLAIN cost."""
+        res = self.run_sql(
+            "CREATE TABLE events (id NUMBER PRIMARY KEY, score NUMBER);",
+            "INSERT INTO events VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70), (8, 80);",
+            "CREATE INDEX idx_events_score ON events(score);",
+            "ANALYZE TABLE events;",
+            "EXPLAIN SELECT * FROM events WHERE score < 25;",
+            "COMMIT;"
+        )
+        self.assertIn("Table EVENTS analyzed (8 rows, 2 columns sampled).", res.stdout)
+        self.assertIn("INDEX RANGE SCAN EVENTS USING IDX_EVENTS_SCORE", res.stdout)
+        self.assertIn("Cost:", res.stdout)
+
+    def test_table_partitioning_and_columnar_spillover(self):
+        """Test Evolution 3: Range/Hash Partitioning, Partition Pruning, and Columnar Engine."""
+        res = self.run_sql(
+            "CREATE TABLE sales (id NUMBER PRIMARY KEY, amount NUMBER) ENGINE = COLUMNAR "
+            "PARTITION BY RANGE (id) ("
+            "PARTITION p1 VALUES LESS THAN (100), "
+            "PARTITION p2 VALUES LESS THAN (200), "
+            "PARTITION p3 VALUES LESS THAN (MAXVALUE));",
+            "INSERT INTO sales VALUES (10, 500), (50, 700), (150, 900), (250, 1100);",
+            "COMMIT;",
+            "EXPLAIN SELECT * FROM sales WHERE id < 100;",
+            "SELECT SUM(amount), COUNT(amount) FROM sales WHERE id < 100;",
+            "SHOW CREATE TABLE sales;"
+        )
+        self.assertIn("[Partition Pruning: 1/3 partitions]", res.stdout)
+        self.assertIn("1200\t2", res.stdout)
+        self.assertIn("ENGINE = COLUMNAR", res.stdout)
+        self.assertIn("PARTITION BY RANGE (ID)", res.stdout)
+
+        # Verify partition metadata survives snapshot reload across process restart
+        res2 = self.run_sql(
+            "EXPLAIN SELECT * FROM sales WHERE id >= 200;",
+            "SELECT SUM(amount) FROM sales WHERE id >= 200;"
+        )
+        self.assertIn("COLUMNAR VECTOR SCAN SALES", res2.stdout)
+        self.assertIn("[Partition Pruning: 1/3 partitions]", res2.stdout)
+        self.assertIn("1100", res2.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

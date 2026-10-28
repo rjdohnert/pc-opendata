@@ -1113,7 +1113,29 @@ static void print_table_ddl(const Table* t) {
             shell_printf(")%s\n", u + 1 < t->uq_count ? "," : "");
         }
     }
-    shell_puts(");");
+    shell_printf(")");
+    if (t->engine_type == ENGINE_COLUMNAR) {
+        shell_printf(" ENGINE = COLUMNAR");
+    } else if (t->engine_type == ENGINE_DISK) {
+        shell_printf(" ENGINE = DISK");
+    }
+    if (t->part_type == PART_HASH && t->part_col_idx >= 0 && t->part_col_idx < t->col_count) {
+        shell_printf(" PARTITION BY HASH (%s) PARTITIONS %d", t->columns[t->part_col_idx].name, t->part_count);
+    } else if (t->part_type == PART_RANGE && t->part_col_idx >= 0 && t->part_col_idx < t->col_count) {
+        shell_printf(" PARTITION BY RANGE (%s) (", t->columns[t->part_col_idx].name);
+        for (int p = 0; p < t->part_count; p++) {
+            if (p > 0) shell_printf(", ");
+            if (t->partitions[p].is_maxvalue) {
+                shell_printf("PARTITION %s VALUES LESS THAN (MAXVALUE)", t->partitions[p].name);
+            } else if (t->columns[t->part_col_idx].type == TYPE_NUMBER) {
+                shell_printf("PARTITION %s VALUES LESS THAN (%s)", t->partitions[p].name, t->partitions[p].upper_bound);
+            } else {
+                shell_printf("PARTITION %s VALUES LESS THAN ('%s')", t->partitions[p].name, t->partitions[p].upper_bound);
+            }
+        }
+        shell_printf(")");
+    }
+    shell_puts(";");
 }
 
 static bool is_supported_db_filename(const char* name) {
@@ -1142,9 +1164,15 @@ static void print_engine_status(void) {
     int total_rows = 0;
     int total_capacity = 0;
     int total_idx_entries = 0;
+    int total_dead_rows = 0;
+    uint64_t total_vacuumed = 0;
+    int partitioned_tables = 0;
     for (int t = 0; t < g_db->table_count; t++) {
         total_rows += g_db->tables[t].row_count;
         total_capacity += g_db->tables[t].capacity;
+        total_dead_rows += g_db->tables[t].dead_row_count;
+        total_vacuumed += g_db->tables[t].total_vacuumed_rows;
+        if (g_db->tables[t].part_type != PART_NONE) partitioned_tables++;
         row_mem_bytes += (size_t)g_db->tables[t].capacity * sizeof(Row);
     }
     for (int i = 0; i < g_db->index_count; i++) {
@@ -1156,7 +1184,9 @@ static void print_engine_status(void) {
     shell_printf("DATABASE_PATH\t%s\n", g_path[0] ? g_path : "(memory)");
     shell_printf("GENERATION\t%llu\n", (unsigned long long)g_generation);
     shell_printf("USER_TABLES\t%d / %d\n", g_db->table_count, MAX_TABLES);
+    shell_printf("PARTITIONED_TABLES\t%d\n", partitioned_tables);
     shell_printf("TOTAL_ROWS\t%d / %d (allocated capacity: %d)\n", total_rows, MAX_TOTAL_ROWS, total_capacity);
+    shell_printf("MVCC_DEAD_ROW_VERSIONS\t%d (reclaimed total: %llu)\n", total_dead_rows, (unsigned long long)total_vacuumed);
     shell_printf("VALUE_LIMIT\t%d bytes per value\n", MAX_VAL_LEN);
     shell_printf("SECONDARY_INDEXES\t%d (%d indexed keys)\n", g_db->index_count, total_idx_entries);
     shell_printf("MEMORY_ALLOCATED_BYTES\t%zu\n", row_mem_bytes);
@@ -1274,27 +1304,37 @@ static bool verify_backup_file(const char* path) {
     return true;
 }
 
-static bool execute_vacuum_database(void) {
+bool execute_vacuum_command(const char* table_name, bool full, bool analyze) {
     if (!g_db) return report_database_error("not connected to any database");
     if (g_readonly) return report_database_error("cannot VACUUM in read-only mode");
+    if (g_raft_role == RAFT_FOLLOWER) return report_database_error("follower nodes accept read-only queries");
+
+    int t_start = 0, t_end = g_db->table_count;
+    if (table_name && table_name[0]) {
+        int idx = find_table_index(g_db, table_name);
+        if (idx < 0) return report_database_error("table does not exist: %s", table_name);
+        t_start = idx;
+        t_end = idx + 1;
+    }
+
     int compacted_tables = 0;
-    for (int t = 0; t < g_db->table_count; t++) {
-        Table* tbl = &g_db->tables[t];
-        int target_cap = tbl->row_count > 16 ? tbl->row_count : 16;
-        if (tbl->capacity > target_cap) {
-            /* Rows are Copy-on-Write shared with g_committed via tbl->storage;
-               detach first so realloc never moves a shared block. */
-            if (!ensure_table_writable(tbl)) return report_database_error("unable to allocate row storage");
-            Row* shrunk = (Row*)realloc(tbl->rows, (size_t)target_cap * sizeof(Row));
-            if (shrunk) {
-                tbl->rows = shrunk;
-                tbl->storage->rows = shrunk;
-                tbl->storage->capacity = target_cap;
-                tbl->capacity = target_cap;
-                compacted_tables++;
-            }
+    size_t total_freed_bytes = 0;
+    int total_reclaimed_versions = 0;
+
+    for (int t = t_start; t < t_end; t++) {
+        size_t freed = 0;
+        int reclaimed = 0;
+        if (!vacuum_table_storage(g_db, t, full, &freed, &reclaimed)) {
+            return false;
+        }
+        if (freed > 0 || reclaimed > 0 || full) compacted_tables++;
+        total_freed_bytes += freed;
+        total_reclaimed_versions += reclaimed;
+        if (analyze) {
+            execute_analyze_table(g_db->tables[t].name);
         }
     }
+
     Image image = {0};
     if (!encode_database_snapshot(g_db, g_identity, g_generation, &image)) {
         free(image.data);
@@ -1310,9 +1350,10 @@ static bool execute_vacuum_database(void) {
     } else {
         free(image.data);
     }
-    shell_printf("VACUUM complete. Compacted %d table%s (Snapshot size: %zu bytes, Generation %llu).\n",
+    shell_printf("VACUUM complete. Compacted %d table%s, reclaimed %d dead MVCC row version%s, freed %zu bytes (Snapshot size: %zu bytes, Generation %llu).\n",
             compacted_tables, compacted_tables == 1 ? "" : "s",
-            snap_bytes, (unsigned long long)g_generation);
+            total_reclaimed_versions, total_reclaimed_versions == 1 ? "" : "s",
+            total_freed_bytes, snap_bytes, (unsigned long long)g_generation);
     return true;
 }
 
@@ -1329,27 +1370,77 @@ static bool explain_statement(Parser* p) {
         char tbl[MAX_NAME_LEN];
         if (!parse_identifier(p, tbl)) return false;
         int t_idx = find_table_index(g_db, tbl);
-        const Table* t_obj = t_idx >= 0 ? &g_db->tables[t_idx] : NULL;
-        if (t_obj && t_obj->stats.is_analyzed) {
-            shell_printf("1. SCAN %s [CBO Est Rows: %d]\n", tbl, t_obj->stats.sample_rows);
-        } else {
-            shell_printf("1. SCAN %s\n", tbl);
+        Table* t_obj = t_idx >= 0 ? &g_db->tables[t_idx] : NULL;
+
+        char right[MAX_NAME_LEN] = {0};
+        bool has_join = false;
+        bool is_left = false;
+        if (p->kind == TK_ID && !token_is_keyword(p, "WHERE") && !token_is_keyword(p, "LEFT") &&
+            !token_is_keyword(p, "INNER") && !token_is_keyword(p, "JOIN") && !token_is_keyword(p, "GROUP") &&
+            !token_is_keyword(p, "ORDER") && !token_is_keyword(p, "LIMIT")) {
+            scan_next_token(p); /* optional table alias */
         }
-        int step = 2;
-        bool is_left = consume_keyword(p, "LEFT");
+        is_left = consume_keyword(p, "LEFT");
         if (is_left) consume_keyword(p, "OUTER");
         else consume_keyword(p, "INNER");
         if (is_left || consume_keyword(p, "JOIN")) {
-            char right[MAX_NAME_LEN];
             if (parse_identifier(p, right)) {
-                if (consume_keyword(p, "ON")) {
-                    shell_printf("%d. %s JOIN %s (using JoinIndex hash acceleration)\n", step++, is_left ? "LEFT" : "HASH", right);
-                }
+                has_join = true;
             }
         }
+
         while (!p->failed && p->kind != TK_END && !token_is_keyword(p, "WHERE") && !token_is_keyword(p, "GROUP") &&
                !token_is_keyword(p, "ORDER") && !token_is_keyword(p, "LIMIT")) scan_next_token(p);
+
+        Filter* filter = calloc(1, sizeof(Filter));
+        bool has_where = false;
+        if (t_obj && filter && token_is_keyword(p, "WHERE")) {
+            Scope sc = {0};
+            sc.tables[0] = t_obj;
+            sc.count = 1;
+            Parser wp = *p;
+            if (parse_where_clause(&wp, &sc, filter) && filter->node_count > 0) {
+                has_where = true;
+            }
+        }
         if (consume_keyword(p, "WHERE")) {
+            has_where = true;
+        }
+
+        bool cbo_use_idx = false;
+        int sec_idx = -1;
+        int est_rows = t_obj ? t_obj->row_count : 0;
+        double est_cost = t_obj ? cbo_estimate_query_cost(g_db, t_obj, 0, has_where ? filter : NULL, &cbo_use_idx, &sec_idx, &est_rows) : 1.0;
+
+        char part_info[96] = {0};
+        if (t_obj && t_obj->part_type != PART_NONE && t_obj->part_count > 0) {
+            uint32_t mask = prune_partitions_for_filter(t_obj, 0, has_where ? filter : NULL);
+            int active_p = 0;
+            for (int pi = 0; pi < t_obj->part_count; pi++) {
+                if (mask & (1u << (unsigned)pi)) active_p++;
+            }
+            snprintf(part_info, sizeof(part_info), " [Partition Pruning: %d/%d partitions]", active_p, t_obj->part_count);
+        }
+
+        if (t_obj && cbo_use_idx && sec_idx >= 0) {
+            shell_printf("1. INDEX RANGE SCAN %s USING %s [CBO Est Rows: %d, Cost: %.2f]%s\n",
+                         tbl, g_db->indexes[sec_idx].name, est_rows, est_cost, part_info);
+        } else if (t_obj && t_obj->engine_type == ENGINE_COLUMNAR) {
+            shell_printf("1. COLUMNAR VECTOR SCAN %s [CBO Est Rows: %d, Cost: %.2f]%s\n",
+                         tbl, est_rows, est_cost, part_info);
+        } else if (t_obj && t_obj->stats.is_analyzed) {
+            shell_printf("1. SCAN %s [CBO Est Rows: %d, Cost: %.2f]%s\n",
+                         tbl, est_rows, est_cost, part_info);
+        } else {
+            shell_printf("1. SCAN %s%s\n", tbl, part_info);
+        }
+        free(filter);
+
+        int step = 2;
+        if (has_join) {
+            shell_printf("%d. %s JOIN %s (using JoinIndex hash acceleration)\n", step++, is_left ? "LEFT" : "HASH", right);
+        }
+        if (has_where) {
             shell_printf("%d. FILTER (WHERE condition)\n", step++);
         }
         while (!p->failed && p->kind != TK_END && !token_is_keyword(p, "GROUP") && !token_is_keyword(p, "ORDER") && !token_is_keyword(p, "LIMIT")) scan_next_token(p);
@@ -1760,8 +1851,16 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             ok = execute_check_integrity();
         } else ok = false;
     } else if (!strcmp(command, "VACUUM") || !strcmp(command, "COMPACT")) {
+        bool v_full = false;
+        bool v_analyze = false;
+        for (int vi = 0; vi < 2; vi++) {
+            if (consume_keyword(&p, "FULL")) v_full = true;
+            else if (consume_keyword(&p, "ANALYZE")) v_analyze = true;
+        }
+        char v_tbl[MAX_NAME_LEN] = {0};
+        if (p.kind == TK_ID) parse_identifier(&p, v_tbl);
         if (consume_statement_end(&p)) {
-            ok = execute_vacuum_database();
+            ok = execute_vacuum_command(v_tbl[0] ? v_tbl : NULL, v_full, v_analyze);
         } else ok = false;
     } else if (!strcmp(command, "EXPORT")) ok = execute_export_statement(&p);
     else if (!strcmp(command, "IMPORT")) ok = execute_import_statement(&p);

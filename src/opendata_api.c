@@ -83,6 +83,10 @@ bool opendata_backup(void) {
     return backup_committed_snapshot();
 }
 
+bool opendata_vacuum(const char* table_name) {
+    return execute_vacuum_command(table_name, true, false);
+}
+
 uint64_t opendata_get_generation(void) {
     return g_generation;
 }

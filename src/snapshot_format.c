@@ -307,6 +307,31 @@ bool encode_database_snapshot(const Database* db, uint64_t identity, uint64_t ge
             encode_u32(image, db->grants[i].privileges);
         }
     }
+    /* Table partitioning & engine metadata (emitted only when non-default). */
+    if (image->ok) {
+        bool has_part_or_engine = false;
+        for (int t = 0; t < db->table_count; t++) {
+            if (db->tables[t].part_type != PART_NONE || db->tables[t].engine_type != ENGINE_MEMORY) {
+                has_part_or_engine = true;
+                break;
+            }
+        }
+        if (has_part_or_engine) {
+            append_snapshot_bytes(image, "PARTIT01", 8);
+            for (int t = 0; t < db->table_count; t++) {
+                const Table* tbl = &db->tables[t];
+                encode_u32(image, (uint32_t)tbl->engine_type);
+                encode_u32(image, (uint32_t)tbl->part_type);
+                encode_u32(image, (uint32_t)(tbl->part_col_idx >= 0 ? tbl->part_col_idx : 0));
+                encode_u32(image, (uint32_t)(tbl->part_count >= 0 ? tbl->part_count : 0));
+                for (int p = 0; p < tbl->part_count && p < MAX_PARTITIONS; p++) {
+                    encode_text(image, tbl->partitions[p].name);
+                    encode_text(image, tbl->partitions[p].upper_bound);
+                    encode_u32(image, tbl->partitions[p].is_maxvalue ? 1u : 0u);
+                }
+            }
+        }
+    }
     if (image->ok) encode_u32(image, calculate_crc32(image->data, image->size));
     if (image->ok && g_tde_enabled) tde_encrypt_image(image);
     return image->ok;
@@ -503,6 +528,44 @@ Database* decode_database_snapshot(Image* image, uint64_t* identity, uint64_t* g
                 if (!image->ok) break;
                 grant->privileges = privileges;
                 db->grant_count++;
+            }
+        }
+    }
+    /* Table partitioning & engine metadata (optional section). */
+    if (image->ok && image->offset < image->size - 4) {
+        unsigned char marker[8];
+        if (!decode_snapshot_bytes(image, marker, sizeof(marker)) ||
+            memcmp(marker, "PARTIT01", sizeof(marker)) != 0) {
+            image->ok = false;
+        } else {
+            for (int t = 0; t < db->table_count && image->ok; t++) {
+                Table* tbl = &db->tables[t];
+                uint32_t eng = decode_u32(image);
+                uint32_t ptype = decode_u32(image);
+                uint32_t pcol = decode_u32(image);
+                uint32_t pcnt = decode_u32(image);
+                if (eng > ENGINE_COLUMNAR || ptype > PART_RANGE || pcnt > MAX_PARTITIONS) {
+                    image->ok = false;
+                    break;
+                }
+                if (ptype != PART_NONE && (pcol >= (uint32_t)tbl->col_count || pcnt == 0)) {
+                    image->ok = false;
+                    break;
+                }
+                tbl->engine_type = (StorageEngineType)eng;
+                tbl->part_type = (PartitionType)ptype;
+                tbl->part_col_idx = (int)pcol;
+                tbl->part_count = (int)pcnt;
+                for (uint32_t p = 0; p < pcnt && image->ok; p++) {
+                    if (!decode_text(image, tbl->partitions[p].name, sizeof(tbl->partitions[p].name)) ||
+                        !decode_text(image, tbl->partitions[p].upper_bound, sizeof(tbl->partitions[p].upper_bound))) {
+                        image->ok = false;
+                        break;
+                    }
+                    uint32_t maxv = decode_u32(image);
+                    if (maxv > 1) { image->ok = false; break; }
+                    tbl->partitions[p].is_maxvalue = (maxv == 1);
+                }
             }
         }
     }

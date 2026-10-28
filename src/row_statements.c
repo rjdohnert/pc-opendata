@@ -337,8 +337,13 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
                 table->rows[conflict_idx].values[tc] = new_val;
             }
             free(existing_copy);
+            table->dead_row_count++;
             (*inserted)++;
         } else {
+            if (table->part_type == PART_RANGE && get_row_partition(table, candidate) < 0) {
+                free(upsert_assigns); free(batch);
+                return report_database_error("partition key value is outside all defined range partitions for table %s", table->name);
+            }
             if (!reserve_insert_capacity(table)) {
                 free(upsert_assigns); free(batch);
                 return false;
@@ -373,6 +378,7 @@ static bool cascade_delete_parent_value(Database* db, const char* parent_tbl, co
                     for (int cr = 0; cr < child->row_count; cr++) {
                         Value* cv = &child->rows[cr].values[c];
                         if (!cv->is_null && compare_typed_values(cdef->type, cv, val) == 0) {
+                            child->dead_row_count++;
                             for (int cc = 0; cc < child->col_count; cc++) {
                                 if (!cascade_delete_parent_value(db, child->name, child->columns[cc].name, &child->rows[cr].values[cc], depth + 1)) {
                                     return false;
@@ -514,9 +520,14 @@ bool execute_update_or_delete(Parser* p, Database* db, bool deleting, int* affec
                 }
                 table->rows[r].values[c] = new_val;
             }
+            if (table->part_type == PART_RANGE && get_row_partition(table, &table->rows[r]) < 0) {
+                free(filter); free(assignment_values);
+                return report_database_error("updated partition key value is outside all defined range partitions for table %s", table->name);
+            }
         }
     }
     if (deleting) table->row_count = write;
+    if (*affected > 0) table->dead_row_count += *affected;
     free(filter);
     free(assignment_values);
     rebuild_secondary_indexes(db);

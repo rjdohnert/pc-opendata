@@ -129,3 +129,47 @@ bool reserve_insert_capacity(Table* table) {
     table->capacity = capacity;
     return true;
 }
+
+bool vacuum_table_storage(Database* db, int table_idx, bool full, size_t* out_freed_bytes, int* out_reclaimed_versions) {
+    if (!db || table_idx < 0 || table_idx >= db->table_count) return false;
+    Table* tbl = &db->tables[table_idx];
+    size_t freed_bytes = 0;
+    int reclaimed = tbl->dead_row_count;
+    tbl->total_vacuumed_rows += (uint64_t)reclaimed;
+    tbl->dead_row_count = 0;
+    tbl->last_vacuum_gen = g_generation;
+
+    int min_cap = full ? 4 : 16;
+    int target_cap = tbl->row_count > min_cap ? tbl->row_count : min_cap;
+    if (tbl->storage && (tbl->capacity > target_cap || atomic_load(&tbl->storage->refcount) > 1)) {
+        int old_cap = tbl->capacity;
+        if (!ensure_table_writable(tbl)) return report_database_error("unable to allocate row storage during VACUUM");
+        if (tbl->capacity > target_cap) {
+            Row* shrunk = (Row*)realloc(tbl->rows, (size_t)target_cap * sizeof(Row));
+            if (shrunk) {
+                if (old_cap > target_cap) {
+                    freed_bytes += (size_t)(old_cap - target_cap) * sizeof(Row);
+                }
+                tbl->rows = shrunk;
+                tbl->storage->rows = shrunk;
+                tbl->storage->capacity = target_cap;
+                tbl->capacity = target_cap;
+            }
+        }
+    }
+
+    for (int i = 0; i < db->index_count; i++) {
+        SecondaryIndex* idx = &db->indexes[i];
+        if (!strcmp(idx->table_name, tbl->name)) {
+            int old_idx_cap = idx->capacity;
+            build_secondary_index(idx, tbl, idx->col_idx);
+            if (old_idx_cap > idx->capacity) {
+                freed_bytes += (size_t)(old_idx_cap - idx->capacity) * sizeof(IndexEntry);
+            }
+        }
+    }
+
+    if (out_freed_bytes) *out_freed_bytes = freed_bytes;
+    if (out_reclaimed_versions) *out_reclaimed_versions = reclaimed;
+    return true;
+}
