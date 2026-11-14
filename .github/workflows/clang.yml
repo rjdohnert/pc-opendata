@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install TLS development files
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev openssl
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev openssl libldap2-dev
       - name: Compile modular and amalgamated binaries
         run: |
           chmod +x build-scripts/wsl-build.sh
