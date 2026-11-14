@@ -20,6 +20,14 @@ jobs:
         run: |
           .\bin\opendata.exe --help
           .\bin\opendata.exe --version
+      - name: Package Windows installer
+        shell: powershell
+        run: |
+          $packageDir = Join-Path $env:RUNNER_TEMP 'OpenDataSQL-Setup'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item .\installer\* -Destination $packageDir -Recurse
+          Copy-Item .\bin\opendata.exe -Destination $packageDir
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath .\installer\OpenDataSQL-Setup.zip -Force
       - name: Generate SHA-256 checksums
         shell: powershell
         run: |
