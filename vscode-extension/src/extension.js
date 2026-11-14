@@ -213,6 +213,26 @@ function escapeHtml(value) {
         .replace(/'/g, '&#39;');
 }
 
+
+function queryDatabaseJson(dbPath, sql) {
+    return new Promise((resolve) => {
+        const bin = getEngineBinaryPath();
+        const args = ['--format', 'json'];
+        if (dbPath) args.push('--database', dbPath);
+        args.push('-e', sql);
+        cp.execFile(bin, args, { windowsHide: true }, (err, stdout) => {
+            if (err) return resolve([]);
+            try {
+                const trimmed = (stdout || '').trim();
+                if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+                    return resolve(JSON.parse(trimmed));
+                }
+            } catch (e) {}
+            resolve([]);
+        });
+    });
+}
+
 function escapeSqlLiteral(value) {
     return String(value).replace(/'/g, "''");
 }
@@ -369,27 +389,38 @@ class OpenDataCodeLensProvider {
             const line = lines[i].trim();
             if (line.startsWith('--') || line.length === 0) continue;
 
-            const isSqlKeyword = /^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|BENCHMARK|WATCH|DIFF|DUMP|SHOW)/i.test(line);
+            const isSqlKeyword = /^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|BENCHMARK|WATCH|DIFF|DUMP|SHOW|DESC|DESCRIBE)/i.test(line);
             if (isSqlKeyword) {
+                let fullStmt = line;
+                let endIdx = i;
+                if (!line.includes(';')) {
+                    for (let j = i + 1; j < lines.length; j++) {
+                        const nextTrim = lines[j].trim();
+                        if (nextTrim.startsWith('--') || nextTrim.length === 0) continue;
+                        fullStmt += ' ' + nextTrim;
+                        endIdx = j;
+                        if (nextTrim.includes(';')) break;
+                    }
+                }
                 const range = new vscode.Range(i, 0, i, lines[i].length);
-
                 codeLenses.push(
                     new vscode.CodeLens(range, {
                         title: '▶ Run Statement',
                         command: 'pcopendata.runStatement',
-                        arguments: [line]
+                        arguments: [fullStmt]
                     }),
                     new vscode.CodeLens(range, {
                         title: '⚡ Benchmark (100x)',
                         command: 'pcopendata.benchmarkStatement',
-                        arguments: [line]
+                        arguments: [fullStmt]
                     }),
                     new vscode.CodeLens(range, {
                         title: '🔍 Explain CBO Plan',
                         command: 'pcopendata.explainStatement',
-                        arguments: [line]
+                        arguments: [fullStmt]
                     })
                 );
+                i = endIdx;
             }
         }
         return codeLenses;
@@ -433,6 +464,14 @@ class OpenDataDatabaseEditorProvider {
             dialectLabel = 'Oracle Database Compatible File';
             badgeColor = '#ef4444';
         }
+
+        webviewPanel.webview.onDidReceiveMessage(async (message) => {
+            if (message.command === 'export') {
+                executeSqlStatement(`DUMP DATABASE TO '${escapeSqlLiteral(filePath)}.sql';`);
+            } else if (message.command === 'check') {
+                executeSqlStatement(`CHECK INTEGRITY;`);
+            }
+        });
 
         webviewPanel.webview.html = `
             <!DOCTYPE html>
@@ -568,57 +607,90 @@ class OpenDataDatabasesTreeProvider {
 }
 
 class OpenDataSchemaTreeProvider {
+    constructor() {
+        this._onDidChangeTreeData = new vscode.EventEmitter();
+        this.onDidChangeTreeData = this._onDidChangeTreeData.event;
+    }
+
+    refresh() {
+        this._onDidChangeTreeData.fire();
+    }
+
     getTreeItem(element) {
         return element;
     }
 
     async getChildren(element) {
+        const folders = vscode.workspace.workspaceFolders;
+        if (!folders || folders.length === 0) return [];
+        const root = folders[0].uri.fsPath;
+        let dbFile = null;
+        try {
+            const files = fs.readdirSync(root);
+            for (const f of files) {
+                const ext = path.extname(f).toLowerCase();
+                if (['.pcod', '.mdf', '.ndf', '.dbf', '.ora'].includes(ext)) {
+                    dbFile = path.join(root, f);
+                    break;
+                }
+            }
+        } catch (e) {}
+
         if (!element) {
-            const invTable = new vscode.TreeItem('INV (3 columns, 2 rows)', vscode.TreeItemCollapsibleState.Collapsed);
-            invTable.iconPath = new vscode.ThemeIcon('table');
-            invTable.contextValue = 'table';
+            if (!dbFile) {
+                const emptyItem = new vscode.TreeItem('No database found in workspace', vscode.TreeItemCollapsibleState.None);
+                emptyItem.iconPath = new vscode.ThemeIcon('info');
+                emptyItem.description = 'CREATE DATABASE in query editor';
+                return [emptyItem];
+            }
 
-            const embTable = new vscode.TreeItem('EMBEDDINGS (3 columns, 3 rows)', vscode.TreeItemCollapsibleState.Collapsed);
-            embTable.iconPath = new vscode.ThemeIcon('symbol-array');
-            embTable.contextValue = 'vectorTable';
+            const tables = await queryDatabaseJson(dbFile, 'SHOW TABLES;');
+            if (!tables || tables.length === 0) {
+                const emptyItem = new vscode.TreeItem('No user tables', vscode.TreeItemCollapsibleState.None);
+                emptyItem.iconPath = new vscode.ThemeIcon('info');
+                emptyItem.description = 'CREATE TABLE to add data';
+                return [emptyItem];
+            }
 
-            const empTable = new vscode.TreeItem('[Employees] (4 columns, 1 row)', vscode.TreeItemCollapsibleState.Collapsed);
-            empTable.iconPath = new vscode.ThemeIcon('table');
-            empTable.contextValue = 'table';
-
-            return [invTable, embTable, empTable];
+            const items = [];
+            for (const t of tables) {
+                const name = t.TABLE_NAME || t.table_name || t.name;
+                if (!name || name === 'DUAL') continue;
+                const cols = t.COLUMNS || t.columns || 0;
+                const rows = t.ROWS || t.rows || 0;
+                const item = new vscode.TreeItem(`${name} (${cols} col${cols == 1 ? '' : 's'}, ${rows} row${rows == 1 ? '' : 's'})`, vscode.TreeItemCollapsibleState.Collapsed);
+                item.iconPath = new vscode.ThemeIcon(name.toUpperCase().includes('VECTOR') || name.toUpperCase().includes('EMBED') ? 'symbol-array' : 'table');
+                item.contextValue = 'table';
+                item.tableName = name;
+                item.dbFile = dbFile;
+                items.push(item);
+            }
+            return items;
         }
 
-        if (element.label.startsWith('INV')) {
-            const col1 = new vscode.TreeItem('ID : NUMBER (PRIMARY KEY)', vscode.TreeItemCollapsibleState.None);
-            col1.iconPath = new vscode.ThemeIcon('key');
-            const col2 = new vscode.TreeItem('NAME : VARCHAR2(50) (NOT NULL)', vscode.TreeItemCollapsibleState.None);
-            col2.iconPath = new vscode.ThemeIcon('symbol-string');
-            const col3 = new vscode.TreeItem('QTY : NUMBER', vscode.TreeItemCollapsibleState.None);
-            col3.iconPath = new vscode.ThemeIcon('symbol-numeric');
-            return [col1, col2, col3];
-        }
-
-        if (element.label.startsWith('EMBEDDINGS')) {
-            const col1 = new vscode.TreeItem('ID : NUMBER (PRIMARY KEY)', vscode.TreeItemCollapsibleState.None);
-            col1.iconPath = new vscode.ThemeIcon('key');
-            const col2 = new vscode.TreeItem('DOC : VARCHAR2(40)', vscode.TreeItemCollapsibleState.None);
-            col2.iconPath = new vscode.ThemeIcon('symbol-string');
-            const col3 = new vscode.TreeItem('VEC : VECTOR(3) [SIMD Cosine/L2]', vscode.TreeItemCollapsibleState.None);
-            col3.iconPath = new vscode.ThemeIcon('symbol-variable');
-            return [col1, col2, col3];
-        }
-
-        if (element.label.startsWith('[Employees]')) {
-            const col1 = new vscode.TreeItem('[EmpID] : INT IDENTITY(1,1)', vscode.TreeItemCollapsibleState.None);
-            col1.iconPath = new vscode.ThemeIcon('key');
-            const col2 = new vscode.TreeItem('[FullName] : NVARCHAR(50)', vscode.TreeItemCollapsibleState.None);
-            col2.iconPath = new vscode.ThemeIcon('symbol-string');
-            const col3 = new vscode.TreeItem('[Salary] : MONEY', vscode.TreeItemCollapsibleState.None);
-            col3.iconPath = new vscode.ThemeIcon('symbol-numeric');
-            const col4 = new vscode.TreeItem('[HireDate] : DATETIME', vscode.TreeItemCollapsibleState.None);
-            col4.iconPath = new vscode.ThemeIcon('calendar');
-            return [col1, col2, col3, col4];
+        if (element.tableName && element.dbFile) {
+            const desc = await queryDatabaseJson(element.dbFile, `DESCRIBE ${element.tableName};`);
+            if (!desc || desc.length === 0) return [];
+            return desc.map(col => {
+                const colName = col.NAME || col.name || col.column;
+                const colType = col.TYPE || col.type || 'VARCHAR2';
+                const colKey = col.KEY || col.key || '';
+                const colNull = col.NULLABLE === 'NO' ? ' (NOT NULL)' : '';
+                const keyStr = colKey ? ` (${colKey})` : '';
+                const item = new vscode.TreeItem(`${colName} : ${colType}${keyStr}${colNull}`, vscode.TreeItemCollapsibleState.None);
+                if (colKey.includes('PRIMARY')) {
+                    item.iconPath = new vscode.ThemeIcon('key');
+                } else if (colType.includes('NUMBER') || colType.includes('INT')) {
+                    item.iconPath = new vscode.ThemeIcon('symbol-numeric');
+                } else if (colType.includes('VECTOR')) {
+                    item.iconPath = new vscode.ThemeIcon('symbol-variable');
+                } else if (colType.includes('DATE') || colType.includes('TIME')) {
+                    item.iconPath = new vscode.ThemeIcon('calendar');
+                } else {
+                    item.iconPath = new vscode.ThemeIcon('symbol-string');
+                }
+                return item;
+            });
         }
 
         return [];

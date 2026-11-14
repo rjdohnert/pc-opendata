@@ -187,7 +187,7 @@ bool iris_load_file(IrisEditor* ed, const char* filepath) {
         return false;
     }
     long sz = ftell(f);
-    if (sz < 0) {
+    if (sz < 0 || sz > 10 * 1024 * 1024) {
         fclose(f);
         return false;
     }

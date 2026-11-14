@@ -61,7 +61,9 @@ void destroy_database(Database* db) {
     if (!db) return;
     for (int t = 0; t < db->table_count; t++) release_table_storage(&db->tables[t]);
     for (int i = 0; i < db->index_count; i++) {
-        if (db->indexes[i].entries) {
+        if (db->indexes[i].is_hnsw) {
+            hnsw_index_destroy(&db->indexes[i]);
+        } else if (db->indexes[i].entries) {
             free(db->indexes[i].entries);
             db->indexes[i].entries = NULL;
         }
@@ -87,7 +89,10 @@ Database* copy_database(const Database* source) {
     copy->index_count = source->index_count;
     for (int i = 0; i < source->index_count; i++) {
         copy->indexes[i] = source->indexes[i];
-        if (source->indexes[i].capacity > 0 && source->indexes[i].entries) {
+        if (source->indexes[i].is_hnsw && source->indexes[i].hnsw_graph) {
+            copy->indexes[i].hnsw_graph = hnsw_index_copy(source->indexes[i].hnsw_graph);
+            copy->indexes[i].entries = NULL;
+        } else if (source->indexes[i].capacity > 0 && source->indexes[i].entries) {
             copy->indexes[i].entries = malloc((size_t)source->indexes[i].capacity * sizeof(IndexEntry));
             if (copy->indexes[i].entries) {
                 memcpy(copy->indexes[i].entries, source->indexes[i].entries,
@@ -110,6 +115,7 @@ int find_table_index(const Database* db, const char* name) {
 }
 
 int find_column_index(const Table* table, const char* name) {
+    if (!table) return -1;
     for (int c = 0; c < table->col_count; c++)
         if (strcmp(table->columns[c].name, name) == 0) return c;
     return -1;
@@ -119,10 +125,14 @@ bool reserve_insert_capacity(Table* table) {
     if (table->row_count >= MAX_ROWS) return report_database_error("row limit (%d) reached for table %s", MAX_ROWS, table->name);
     if (!ensure_table_writable(table)) return report_database_error("unable to allocate row storage");
     if (table->row_count < table->capacity) return true;
+    int old_cap = table->capacity;
     int capacity = table->capacity ? table->capacity * 2 : 4;
     if (capacity > MAX_ROWS) capacity = MAX_ROWS;
     Row* rows = realloc(table->storage->rows, (size_t)capacity * sizeof(Row));
     if (!rows) return report_database_error("unable to allocate row storage");
+    if (capacity > old_cap) {
+        memset(rows + old_cap, 0, (size_t)(capacity - old_cap) * sizeof(Row));
+    }
     table->storage->rows = rows;
     table->storage->capacity = capacity;
     table->rows = rows;
@@ -161,10 +171,14 @@ bool vacuum_table_storage(Database* db, int table_idx, bool full, size_t* out_fr
     for (int i = 0; i < db->index_count; i++) {
         SecondaryIndex* idx = &db->indexes[i];
         if (!strcmp(idx->table_name, tbl->name)) {
-            int old_idx_cap = idx->capacity;
-            build_secondary_index(idx, tbl, idx->col_idx);
-            if (old_idx_cap > idx->capacity) {
-                freed_bytes += (size_t)(old_idx_cap - idx->capacity) * sizeof(IndexEntry);
+            if (idx->is_hnsw) {
+                hnsw_index_build(idx, tbl, idx->col_idx);
+            } else {
+                int old_idx_cap = idx->capacity;
+                build_secondary_index(idx, tbl, idx->col_idx);
+                if (old_idx_cap > idx->capacity) {
+                    freed_bytes += (size_t)(old_idx_cap - idx->capacity) * sizeof(IndexEntry);
+                }
             }
         }
     }
@@ -172,4 +186,25 @@ bool vacuum_table_storage(Database* db, int table_idx, bool full, size_t* out_fr
     if (out_freed_bytes) *out_freed_bytes = freed_bytes;
     if (out_reclaimed_versions) *out_reclaimed_versions = reclaimed;
     return true;
+}
+
+bool g_autovacuum_enabled = true;
+double g_autovacuum_threshold = 0.20;
+
+int run_autovacuum_sweep(Database* db) {
+    if (!g_autovacuum_enabled || !db || g_readonly) return 0;
+    int vacuumed = 0;
+    for (int t = 0; t < db->table_count; t++) {
+        Table* tbl = &db->tables[t];
+        int total = tbl->row_count + tbl->dead_row_count;
+        if (tbl->dead_row_count >= 16 && total > 0 &&
+            ((double)tbl->dead_row_count / (double)total) >= g_autovacuum_threshold) {
+            size_t freed = 0;
+            int reclaimed = 0;
+            if (vacuum_table_storage(db, t, false, &freed, &reclaimed)) {
+                vacuumed++;
+            }
+        }
+    }
+    return vacuumed;
 }

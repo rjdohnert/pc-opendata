@@ -71,6 +71,7 @@ static void* run_periodic_backups(void* context) {
 #endif
         if (monotonic_seconds() - last >= args->interval) {
             lock_snapshot_io();
+            if (g_db) run_autovacuum_sweep(g_db);
             bool ok = backup_committed_snapshot_locked(args->database_path, args->backup_dir);
             atomic_store(args->failed_flag, !ok);
             unlock_snapshot_io();
@@ -91,6 +92,9 @@ static void* run_periodic_backups(void* context) {
 
 static bool start_periodic_backups_with_stop(atomic_bool* stop_flag, atomic_bool* failed_flag) {
     if (g_readonly || g_backup_dir[0] == '\0' || g_backup_interval == 0) return true;
+    if (g_worker_stop_flag != NULL) {
+        stop_periodic_backups();
+    }
     BackupWorkerArgs* args = calloc(1, sizeof(*args));
     if (!args) return false;
     snprintf(args->database_path, sizeof(args->database_path), "%s", g_path);

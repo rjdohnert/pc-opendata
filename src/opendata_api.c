@@ -99,6 +99,10 @@ int opendata_get_error_count(void) {
     return atomic_load(&g_errors);
 }
 
+const char* opendata_errmsg(void) {
+    return g_last_error[0] ? g_last_error : "no error";
+}
+
 void opendata_close(void) {
     if (!g_db && !g_committed) return;
     if (!g_readonly) {
@@ -107,10 +111,11 @@ void opendata_close(void) {
         }
         backup_committed_snapshot();
     }
-    if (g_pending) fprintf(stderr, "NOTICE: uncommitted transaction discarded at exit.\n");
+    if (g_pending && !g_silent_mode) fprintf(stderr, "NOTICE: uncommitted transaction discarded at exit.\n");
     destroy_database(g_db); g_db = NULL;
     destroy_database(g_committed); g_committed = NULL;
     clear_all_savepoints();
+    undo_log_clear();
     release_database_file_lock();
     shutdown_snapshot_io();
     g_readonly = false;
@@ -129,8 +134,10 @@ OpendataStmt* opendata_prepare(const char* sql) {
 
     bool in_quote = false;
     for (const char* s = sql; *s; s++) {
-        if (*s == '\'') in_quote = !in_quote;
-        else if (!in_quote && *s == '?') {
+        if (*s == '\'') {
+            if (in_quote && *(s + 1) == '\'') s++;
+            else in_quote = !in_quote;
+        } else if (!in_quote && *s == '?') {
             if (stmt->param_count >= 16) { free(stmt); return NULL; }
             stmt->param_count++;
         }
@@ -139,7 +146,7 @@ OpendataStmt* opendata_prepare(const char* sql) {
 }
 
 bool opendata_bind_int(OpendataStmt* stmt, int param_idx, int64_t val) {
-    if (!stmt || param_idx < 1 || param_idx > 16) return false;
+    if (!stmt || param_idx < 1 || param_idx > stmt->param_count) return false;
     int idx = param_idx - 1;
     snprintf(stmt->bound_params[idx].text, sizeof(stmt->bound_params[idx].text), "%lld", (long long)val);
     stmt->bound_params[idx].is_null = false;
@@ -147,8 +154,17 @@ bool opendata_bind_int(OpendataStmt* stmt, int param_idx, int64_t val) {
     return true;
 }
 
+bool opendata_bind_double(OpendataStmt* stmt, int param_idx, double val) {
+    if (!stmt || param_idx < 1 || param_idx > stmt->param_count) return false;
+    int idx = param_idx - 1;
+    snprintf(stmt->bound_params[idx].text, sizeof(stmt->bound_params[idx].text), "%.10g", val);
+    stmt->bound_params[idx].is_null = false;
+    stmt->is_bound[idx] = true;
+    return true;
+}
+
 bool opendata_bind_text(OpendataStmt* stmt, int param_idx, const char* str) {
-    if (!stmt || param_idx < 1 || param_idx > 16 || !str) return false;
+    if (!stmt || param_idx < 1 || param_idx > stmt->param_count || !str) return false;
     int idx = param_idx - 1;
     snprintf(stmt->bound_params[idx].text, sizeof(stmt->bound_params[idx].text), "%s", str);
     stmt->bound_params[idx].is_null = false;
@@ -156,8 +172,31 @@ bool opendata_bind_text(OpendataStmt* stmt, int param_idx, const char* str) {
     return true;
 }
 
+bool opendata_bind_vector(OpendataStmt* stmt, int param_idx, const float* vec, int dim) {
+    if (!stmt || param_idx < 1 || param_idx > stmt->param_count || !vec || dim < 1 || dim > 64) return false;
+    int idx = param_idx - 1;
+    char* p = stmt->bound_params[idx].text;
+    size_t cap = sizeof(stmt->bound_params[idx].text);
+    size_t off = 0;
+    p[off++] = '[';
+    for (int i = 0; i < dim; i++) {
+        if (i > 0 && off < cap - 1) p[off++] = ',';
+        int n = snprintf(p + off, cap - off, "%g", (double)vec[i]);
+        if (n < 0 || (size_t)n >= cap - off) {
+            return false;
+        }
+        off += (size_t)n;
+        if (off >= cap - 2) break;
+    }
+    if (off < cap - 1) p[off++] = ']';
+    p[off] = '\0';
+    stmt->bound_params[idx].is_null = false;
+    stmt->is_bound[idx] = true;
+    return true;
+}
+
 bool opendata_bind_null(OpendataStmt* stmt, int param_idx) {
-    if (!stmt || param_idx < 1 || param_idx > 16) return false;
+    if (!stmt || param_idx < 1 || param_idx > stmt->param_count) return false;
     int idx = param_idx - 1;
     stmt->bound_params[idx].is_null = true;
     stmt->bound_params[idx].text[0] = '\0';
@@ -172,17 +211,29 @@ bool opendata_step(OpendataStmt* stmt) {
         size_t out_len = 0;
         int p_idx = 0;
         bool in_quote = false;
+        bool truncated = false;
 
         for (const char* s = stmt->sql_template; *s; s++) {
             if (*s == '\'') {
-                in_quote = !in_quote;
-                if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *s;
+                if (in_quote && *(s + 1) == '\'') {
+                    if (out_len + 2 < sizeof(concrete_sql)) {
+                        concrete_sql[out_len++] = *s++;
+                        concrete_sql[out_len++] = *s;
+                    } else { truncated = true; s++; }
+                } else {
+                    in_quote = !in_quote;
+                    if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *s;
+                    else truncated = true;
+                }
             } else if (!in_quote && *s == '?') {
                 if (p_idx < stmt->param_count && stmt->is_bound[p_idx]) {
                     const Value* v = &stmt->bound_params[p_idx];
                     if (v->is_null) {
                         const char* n = "NULL";
-                        while (*n && out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *n++;
+                        while (*n) {
+                            if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *n++;
+                            else { truncated = true; break; }
+                        }
                     } else {
                         /* Only splice unquoted text that is a well-formed numeric literal.
                            A loose character allowlist would let sequences like "1--"
@@ -201,26 +252,39 @@ bool opendata_step(OpendataStmt* stmt) {
                         }
                         if (is_num && v->text[0] != '\0') {
                             const char* num = v->text;
-                            while (*num && out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *num++;
+                            while (*num) {
+                                if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *num++;
+                                else { truncated = true; break; }
+                            }
                         } else {
                             if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = '\'';
-                            for (const char* c = v->text; *c && out_len + 2 < sizeof(concrete_sql); c++) {
+                            else truncated = true;
+                            for (const char* c = v->text; *c; c++) {
+                                if (out_len + 2 >= sizeof(concrete_sql)) { truncated = true; break; }
                                 if (*c == '\'') concrete_sql[out_len++] = '\'';
                                 concrete_sql[out_len++] = *c;
                             }
                             if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = '\'';
+                            else truncated = true;
                         }
                     }
                 } else {
                     const char* n = "NULL";
-                    while (*n && out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *n++;
+                    while (*n) {
+                        if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *n++;
+                        else { truncated = true; break; }
+                    }
                 }
                 p_idx++;
             } else {
                 if (out_len + 1 < sizeof(concrete_sql)) concrete_sql[out_len++] = *s;
+                else truncated = true;
             }
         }
         concrete_sql[out_len] = '\0';
+        if (truncated) {
+            return report_database_error("bound statement exceeds maximum query length");
+        }
 
         free(stmt->capture.rows);
         memset(&stmt->capture, 0, sizeof(stmt->capture));
@@ -254,6 +318,34 @@ const char* opendata_column_text(OpendataStmt* stmt, int col_idx) {
     if (!stmt || stmt->current_row < 0 || stmt->current_row >= stmt->capture.row_count ||
         col_idx < 0 || col_idx >= stmt->capture.col_count) return NULL;
     return stmt->capture.rows[stmt->current_row][col_idx].text;
+}
+
+int64_t opendata_column_int64(OpendataStmt* stmt, int col_idx) {
+    const char* txt = opendata_column_text(stmt, col_idx);
+    if (!txt || !*txt) return 0;
+    return (int64_t)strtoll(txt, NULL, 10);
+}
+
+double opendata_column_double(OpendataStmt* stmt, int col_idx) {
+    const char* txt = opendata_column_text(stmt, col_idx);
+    if (!txt || !*txt) return 0.0;
+    return strtod(txt, NULL);
+}
+
+int opendata_column_vector(OpendataStmt* stmt, int col_idx, float* out_vec, int max_dim) {
+    const char* txt = opendata_column_text(stmt, col_idx);
+    if (!txt || !*txt || !out_vec || max_dim <= 0) return 0;
+    while (*txt && (*txt == '[' || is_sql_whitespace(*txt))) txt++;
+    int count = 0;
+    while (*txt && *txt != ']' && count < max_dim) {
+        char* end = NULL;
+        float val = strtof(txt, &end);
+        if (end == txt) break;
+        out_vec[count++] = val;
+        txt = end;
+        while (*txt && (*txt == ',' || is_sql_whitespace(*txt))) txt++;
+    }
+    return count;
 }
 
 bool opendata_column_is_null(OpendataStmt* stmt, int col_idx) {
@@ -344,6 +436,7 @@ struct OpendataContext {
     atomic_bool backup_stop;
     atomic_bool backup_failed;
     atomic_bool* backup_worker_stop;
+    char last_error[MAX_VAL_LEN];
 };
 
 static void context_save(OpendataCtx* dest) {
@@ -364,6 +457,7 @@ static void context_save(OpendataCtx* dest) {
     dest->file_lock = get_database_file_lock();
     dest->backup_worker = get_backup_worker_handle();
     dest->backup_worker_stop = get_backup_worker_stop_flag();
+    snprintf(dest->last_error, sizeof(dest->last_error), "%s", g_last_error);
 }
 
 static void context_load(const OpendataCtx* src) {
@@ -474,4 +568,9 @@ void opendata_ctx_destroy(OpendataCtx* ctx) {
     if (!ctx) return;
     opendata_ctx_close(ctx);
     free(ctx);
+}
+
+const char* opendata_ctx_errmsg(OpendataCtx* ctx) {
+    if (ctx && ctx->last_error[0]) return ctx->last_error;
+    return g_last_error[0] ? g_last_error : "no error";
 }

@@ -24,6 +24,7 @@ typedef int socket_t;
 #endif
 
 bool g_sync_replication = false;
+bool g_cluster_plaintext_mode = false;
 _Atomic RaftRole g_raft_role = RAFT_LEADER;
 int g_raft_node_id = 1;
 /* Accessed from both the cluster worker and the network/main threads. */
@@ -86,24 +87,19 @@ static bool raft_connect_with_timeout(socket_t s, const struct sockaddr_in* dest
     u_long nonblock = 1;
     ioctlsocket(s, (long)FIONBIO, &nonblock);
     int rc = connect(s, (const struct sockaddr*)dest, sizeof(*dest));
-    if (rc == 0) return true;
-
-    if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(s, &wfds);
-    TIMEVAL tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-int sel = select(0, NULL, &wfds, NULL, &tv);
-    int err = 0; int err_len = sizeof(err); getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len);
-    if (sel <= 0) return false;
-
-
-
-
-
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len) != 0 || err != 0) return false;
+    if (rc != 0) {
+        if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        TIMEVAL tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        int sel = select(0, NULL, &wfds, NULL, &tv);
+        int err = 0; int err_len = sizeof(err);
+        if (sel <= 0) return false;
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len) != 0 || err != 0) return false;
+    }
     nonblock = 0;
     ioctlsocket(s, (long)FIONBIO, &nonblock);
     DWORD ms = (DWORD)timeout_ms;
@@ -115,32 +111,26 @@ int sel = select(0, NULL, &wfds, NULL, &tv);
     if (flags < 0) return false;
     fcntl(s, F_SETFL, flags | O_NONBLOCK);
     int rc = connect(s, (const struct sockaddr*)dest, sizeof(*dest));
-    if (rc == 0) { fcntl(s, F_SETFL, flags); return true; }
-    if (errno != EINPROGRESS) { fcntl(s, F_SETFL, flags); return false; }
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(s, &wfds);
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-int sel = select(0, NULL, &wfds, NULL, &tv);
-    int err = 0; int err_len = sizeof(err); getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len);
-    if (sel <= 0) return false;
-    if (select((int)s + 1, NULL, &wfds, NULL, &tv) <= 0) { fcntl(s, F_SETFL, flags); return false; }
-    
-    socklen_t err_len = sizeof(err);
-
-    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0 || err != 0) {
-        fcntl(s, F_SETFL, flags);
-        return false;
+    if (rc != 0) {
+        if (errno != EINPROGRESS) { fcntl(s, F_SETFL, flags); return false; }
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        if (select((int)s + 1, NULL, &wfds, NULL, &tv) <= 0) { fcntl(s, F_SETFL, flags); return false; }
+        int err = 0;
+        socklen_t err_len = sizeof(err);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0 || err != 0) {
+            fcntl(s, F_SETFL, flags);
+            return false;
+        }
     }
     fcntl(s, F_SETFL, flags);
     struct timeval iotv;
     iotv.tv_sec = timeout_ms / 1000;
     iotv.tv_usec = (timeout_ms % 1000) * 1000;
-int sel = select(0, NULL, &wfds, NULL, &tv);
-    int err = 0; int err_len = sizeof(err); getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len);
-    if (sel <= 0) return false;
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &iotv, sizeof(iotv));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &iotv, sizeof(iotv));
     return true;
@@ -194,7 +184,6 @@ static RaftHeader raft_header_from_wire(RaftHeader h) {
     return raft_header_to_wire(h); /* le<->host is the same operation */
 }
 
-#ifdef OPENDATA_TEST_CLUSTER_PLAINTEXT
 static bool net_send_all(socket_t sock, const void* data, size_t len) {
     const char* ptr = (const char*)data;
     size_t sent = 0;
@@ -211,19 +200,32 @@ static bool net_send_all(socket_t sock, const void* data, size_t len) {
     }
     return true;
 }
-#endif
 
-#ifdef OPENDATA_TEST_CLUSTER_PLAINTEXT
+static uint64_t raft_monotonic_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+#endif
+}
+
 static bool net_recv_all(socket_t sock, void* data, size_t len, int timeout_sec) {
     char* ptr = (char*)data;
     size_t received = 0;
+    uint64_t deadline_ms = raft_monotonic_ms() + (uint64_t)(timeout_sec > 0 ? timeout_sec : 1) * 1000ULL;
 
     fd_set fds;
-    struct timeval tv;
-    tv.tv_sec = timeout_sec;
-    tv.tv_usec = 0;
 
     while (received < len) {
+        uint64_t now_ms = raft_monotonic_ms();
+        if (now_ms >= deadline_ms) return false;
+        uint64_t rem_ms = deadline_ms - now_ms;
+        struct timeval tv;
+        tv.tv_sec = (long)(rem_ms / 1000ULL);
+        tv.tv_usec = (long)((rem_ms % 1000ULL) * 1000ULL);
+
         FD_ZERO(&fds);
         FD_SET(sock, &fds);
         int sel = select((int)sock + 1, &fds, NULL, NULL, &tv);
@@ -241,13 +243,13 @@ static bool net_recv_all(socket_t sock, void* data, size_t len, int timeout_sec)
     }
     return true;
 }
-#endif
 
 static ClusterTlsStream* cluster_stream_accept(socket_t socket) {
 #ifdef OPENDATA_TEST_CLUSTER_PLAINTEXT
     (void)socket;
     return (ClusterTlsStream*)(uintptr_t)1;
 #else
+    if (g_cluster_plaintext_mode) return (ClusterTlsStream*)(uintptr_t)1;
     return cluster_tls_accept(g_cluster_tls, (intptr_t)socket);
 #endif
 }
@@ -257,6 +259,7 @@ static ClusterTlsStream* cluster_stream_connect(socket_t socket, const char* hos
     (void)socket; (void)host; (void)node_id;
     return (ClusterTlsStream*)(uintptr_t)1;
 #else
+    if (g_cluster_plaintext_mode) return (ClusterTlsStream*)(uintptr_t)1;
     return cluster_tls_connect(g_cluster_tls, (intptr_t)socket, host, node_id);
 #endif
 }
@@ -273,6 +276,7 @@ static bool cluster_stream_send_all(socket_t socket, ClusterTlsStream* stream,
     (void)stream;
     return net_send_all(socket, data, length);
 #else
+    if (g_cluster_plaintext_mode) return net_send_all(socket, data, length);
     (void)socket;
     return cluster_tls_send_all(stream, data, length);
 #endif
@@ -284,6 +288,7 @@ static bool cluster_stream_recv_all(socket_t socket, ClusterTlsStream* stream,
     (void)stream;
     return net_recv_all(socket, data, length, 2);
 #else
+    if (g_cluster_plaintext_mode) return net_recv_all(socket, data, length, 2);
     (void)socket;
     return cluster_tls_recv_all(stream, data, length);
 #endif
@@ -294,13 +299,14 @@ static bool cluster_stream_auth_matches(ClusterTlsStream* stream, int node_id) {
     (void)stream; (void)node_id;
     return true;
 #else
+    if (g_cluster_plaintext_mode) return true;
     return cluster_stream_peer_node_id(stream) == node_id;
 #endif
 }
 
 static void cluster_stream_close(ClusterTlsStream* stream) {
 #ifndef OPENDATA_TEST_CLUSTER_PLAINTEXT
-    cluster_tls_close(stream);
+    if (!g_cluster_plaintext_mode) cluster_tls_close(stream);
 #else
     (void)stream;
 #endif
@@ -375,11 +381,13 @@ static void* cluster_follower_worker(void* unused) {
 #endif
     (void)unused;
     while (atomic_load(&g_cluster_running)) {
+        if (g_cluster_listener == INVALID_SOCK) break;
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(g_cluster_listener, &fds);
-        struct timeval tv = {0, 200000};
+        struct timeval tv = {0, 50000};
         int sel = select((int)g_cluster_listener + 1, &fds, NULL, NULL, &tv);
+        if (!atomic_load(&g_cluster_running)) break;
         uint64_t now_ms = (uint64_t)(monotonic_seconds() * 1000.0);
         uint64_t last_hb = atomic_load(&g_last_heartbeat_ms);
         if (last_hb == 0) {
@@ -543,6 +551,8 @@ static void* cluster_follower_worker(void* unused) {
                         } else if (hdr.term == term) {
                             if (atomic_load(&g_voted_for_term) != term ||
                                 atomic_load(&g_voted_for_node) == (int)hdr.node_id) {
+                                atomic_store(&g_voted_for_term, term);
+                                atomic_store(&g_voted_for_node, (int)hdr.node_id);
                                 grant = true; /* not yet voted this term, or re-vote for same node */
                             }
                         }
@@ -613,9 +623,11 @@ bool cluster_init(const ClusterConfig* config) {
     }
     if (!g_cluster_tls) {
 #ifndef OPENDATA_TEST_CLUSTER_PLAINTEXT
-        g_cluster_tls = cluster_tls_create(config->cert_path, config->key_path,
-                                           config->ca_path, config->node_id);
-        if (!g_cluster_tls) return false;
+        if (!g_cluster_plaintext_mode) {
+            g_cluster_tls = cluster_tls_create(config->cert_path, config->key_path,
+                                               config->ca_path, config->node_id);
+            if (!g_cluster_tls) return false;
+        }
 #endif
     }
 
@@ -748,19 +760,19 @@ void cluster_shutdown(void) {
     atomic_store(&g_raft_role, RAFT_LEADER);
     if (atomic_load(&g_cluster_running)) {
         atomic_store(&g_cluster_running, false);
-        if (g_cluster_listener != INVALID_SOCK) {
-            CLOSE_SOCK(g_cluster_listener);
-            g_cluster_listener = INVALID_SOCK;
-        }
 #ifdef _WIN32
         if (g_cluster_thread) {
-            WaitForSingleObject(g_cluster_thread, 1000);
+            WaitForSingleObject(g_cluster_thread, 2000);
             CloseHandle(g_cluster_thread);
             g_cluster_thread = NULL;
         }
 #else
         pthread_join(g_cluster_thread, NULL);
 #endif
+        if (g_cluster_listener != INVALID_SOCK) {
+            CLOSE_SOCK(g_cluster_listener);
+            g_cluster_listener = INVALID_SOCK;
+        }
     }
     cluster_tls_destroy(g_cluster_tls);
     g_cluster_tls = NULL;

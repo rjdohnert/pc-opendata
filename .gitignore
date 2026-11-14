@@ -1,0 +1,96 @@
+# ==============================================================================
+# PC/OpenData SQL Server - Git ignore rules
+# Build artifacts, local databases, and machine-specific files excluded from
+# the open source release.
+# ==============================================================================
+
+# ---- Build output directories ----
+bin/
+bin-asan/
+build/
+build-direct/
+build-native/
+out/
+
+# ---- Compiled binaries and objects ----
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.exp
+
+# AddressSanitizer runtime artifacts
+clang_rt.asan_dynamic-*.dll
+
+# ---- CMake / generated build files ----
+CMakeCache.txt
+CMakeFiles/
+.cmake/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ---- Local database files and runtime state ----
+*.pcod
+*.pcod.lock
+*.wal
+*.bak.tmp
+test_db_dir/
+test_feat_backups/
+test_rec_backups/
+test_sql_backups/
+
+# ---- Test artifacts ----
+tests/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ---- VS Code extension packaging ----
+*.vsix
+vscode-extension/node_modules/
+vscode-extension/out/
+
+# ---- OS / editor noise ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+*.swo
+*~
+.vs/
+.vscode/
+.idea/
+
+# ---- Local environment / secrets ----
+*.pem
+*.key
+*.crt
+*.env
+server.env
+
+# ---- Test & Distribution artifacts ----
+selftest_tmp/
+*.mdf
+*.dbf
+*.ldf
+*.zip
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.rpm
+*.deb
+*.iso
+*.msi
+*.exe.manifest
+*.log
+*.pid
+*.tmp
+scratch/

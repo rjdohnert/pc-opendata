@@ -14,6 +14,8 @@ void scan_next_token(Parser* p) {
         }
         break;
     }
+    if (!p->statement_start) p->statement_start = s;
+    p->token_start = s;
     size_t length = 0;
     if (!*s) p->kind = TK_END;
     else if (is_identifier_start(*s)) {
@@ -29,10 +31,11 @@ void scan_next_token(Parser* p) {
             if (length + 1 >= sizeof(p->text)) { p->failed = true; break; }
             p->text[length++] = *s++;
         } while (is_ascii_digit(*s) || *s == '.');
-    } else if (*s == '[') {
+    } else if (*s == '[' || *s == '"' || *s == '`') {
+        char close_char = (*s == '[') ? ']' : *s;
         s++; p->kind = TK_ID; bool closed = false;
         while (*s) {
-            if (*s == ']') { s++; closed = true; break; }
+            if (*s == close_char) { s++; closed = true; break; }
             if (length + 1 >= sizeof(p->text)) { p->failed = true; break; }
             p->text[length++] = uppercase_ascii(*s++);
         }
@@ -53,7 +56,16 @@ void scan_next_token(Parser* p) {
         case '(': p->kind = TK_LP; break; case ')': p->kind = TK_RP; break;
         case ',': p->kind = TK_COMMA; break; case '*': p->kind = TK_STAR; break;
         case '.': p->kind = TK_DOT; break; case ';': p->kind = TK_SEMI; break;
-        case '+': p->kind = TK_PLUS; break; case '-': p->kind = TK_MINUS; break;
+        case '+': p->kind = TK_PLUS; break;
+        case '-':
+            if (*s == '>') {
+                s++;
+                if (*s == '>') { s++; p->kind = TK_JSON_TEXT_ARROW; }
+                else { p->kind = TK_JSON_ARROW; }
+            } else {
+                p->kind = TK_MINUS;
+            }
+            break;
         case '/': p->kind = TK_SLASH; break;
         case '?': p->kind = TK_HELP; break;
         case '=': p->kind = TK_EQ; break;
@@ -96,7 +108,31 @@ bool consume_statement_end(Parser* p) {
 bool parse_typed_literal(Parser* p, const ColumnDef* column, Value* value) {
     memset(value, 0, sizeof(*value));
     if (consume_keyword(p, "NULL")) { value->is_null = true; return true; }
+    if (consume_keyword(p, "DEFAULT")) {
+        if (column->has_default) {
+            value->is_null = false;
+            snprintf(value->text, sizeof(value->text), "%s", column->default_value);
+            return true;
+        } else if (column->auto_increment) {
+            value->is_null = true;
+            return true;
+        } else if (column->nullable) {
+            value->is_null = true;
+            return true;
+        }
+        return false;
+    }
     if (column->type == TYPE_NUMBER) {
+        if (consume_keyword(p, "TRUE")) {
+            value->is_null = false;
+            memcpy(value->text, "1", 2);
+            return true;
+        }
+        if (consume_keyword(p, "FALSE")) {
+            value->is_null = false;
+            memcpy(value->text, "0", 2);
+            return true;
+        }
         if (p->kind != TK_NUMBER || !normalize_decimal(p->text, value->text)) return false;
     } else {
         if (p->kind != TK_STRING) return false;

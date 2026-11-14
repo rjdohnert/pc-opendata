@@ -1,0 +1,258 @@
+================================================================================
+          PC/OpenData SQL Server (pcodSQL) — Release Changelog
+================================================================================
+Product:         PC/OpenData SQL Server
+Release Version: 27.0.0 (Enterprise Enhancement & Hardening Release)
+Date:            November 1, 2026
+Author / Org:    PC/OpenSystems LLC
+Platforms:       Windows Server / Windows 10/11, Enterprise Linux, Sun Solaris
+Language:        ISO C11 (Strict Standards Compliance, Zero Compiler Warnings)
+================================================================================
+
+OVERVIEW
+--------------------------------------------------------------------------------
+This release of PC/OpenData SQL Server introduces major enterprise integration
+capabilities, high-dimensional vector search enhancements, continuous disaster
+recovery, window analytical processing, and deep security and performance
+hardening across the database engine.
+
+All features are native C11 implementations maintaining full ACID durability,
+zero third-party runtime dependencies beyond standard OS libraries, and strict
+cross-platform compatibility across Windows, Linux, and Solaris.
+
+
+1. MAJOR NEW SUBSYSTEMS & WIRE PROTOCOLS
+--------------------------------------------------------------------------------
+* PostgreSQL v3 Wire Protocol Shim (Frontend Adapter):
+  - Added automatic protocol detection to the asynchronous network reactor.
+  - Full support for PostgreSQL v3 connection lifecycle:
+    * SSLRequest negotiation
+    * StartupMessage protocol parsing
+    * Password authentication challenge and parameter status handshake
+    * Simple Query ('Q') pipeline
+    * RowDescription ('T'), DataRow ('D'), CommandComplete ('C'), ReadyForQuery ('Z')
+    * Parse ('P'), Bind ('B'), Describe ('D'), Execute ('E'), and Sync ('S')
+  - Enables direct, zero-code-change connectivity from standard PostgreSQL client
+    tools and drivers (psql, DBeaver, psycopg2, node-postgres, asyncpg, etc.).
+
+* Windows Service Registration & Management:
+  - Added native Windows Service Control Manager (SCM) integration:
+    * --install-service [name]: Register background Windows Service
+    * --uninstall-service [name]: Deregister and remove Windows Service
+    * --start-service [name]: Start background Windows Service
+    * --stop-service [name]: Signal and stop running Windows Service
+  - Automatically handles service dispatcher lifecycle, ServiceMain entry point,
+    and SERVICE_CONTROL_STOP control signals with graceful database flushing.
+
+* Native HNSW (Hierarchical Navigable Small World) Vector Indexing:
+  - Implemented multi-layer HNSW graph indexing for high-dimensional embeddings:
+    * DDL syntax: CREATE INDEX <idx> ON <tbl> USING HNSW (<col>);
+    * Accelerates vector nearest-neighbor search from O(N) to O(log N).
+    * Integrated with Cosine Distance (<=>) and Euclidean L2 Distance (<->).
+    * Sub-millisecond approximate nearest neighbor (ANN) retrieval.
+    * Persistent graph serialization and restoration across database snapshot
+      generations.
+
+* Continuous WAL Archiving & Point-In-Time Recovery (PITR):
+  - Added continuous differential write-ahead log (WAL) segment archiving:
+    * Automatically seals and rotates WAL segments into --backup-dir.
+  - Implemented exact-second Point-In-Time Recovery:
+    * CLI syntax: opendata --database <db> --backup-dir <dir> --pitr <timestamp>
+    * Locates base snapshot prior to target timestamp.
+    * Chronologically replays differential page deltas up to target epoch second.
+    * Discards subsequent transactions, enabling precise historical rollback.
+
+* ISO SQL Window Analytical Functions:
+  - Added parser and execution engine support for SQL window functions:
+    * ROW_NUMBER() OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])
+    * RANK() OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])
+    * DENSE_RANK() OVER ([PARTITION BY col, ...] [ORDER BY col [ASC|DESC], ...])
+  - Provides partitioned ranking and windowed aggregations without self-joins.
+
+* Semi-Structured JSON Path Extraction & Operators:
+  - Implemented native JSON arrow operators and scalar extraction functions:
+    * col->'path': Extracts JSON element / object preserving JSON semantics.
+    * col->>'path': Extracts unquoted scalar string value.
+    * JSON_VALUE(col, 'path'): ANSI-compatible scalar value extraction.
+    * JSON_EXTRACT(col, 'path'): Structural element extraction.
+  - Supports object keys ('key') and array indexing ('[0]', '[1]').
+
+* Enterprise Active Directory & LDAP Directory Authentication:
+  - Native integration with Microsoft Active Directory and OpenLDAP / FreeIPA:
+    * Active Directory User Principal Name (UPN) authentication (user@domain.com)
+    * LDAP simple / encrypted bind with search filter resolution
+    * Security group membership resolution to database ADMIN role
+    * Cross-platform: Uses wldap32.dll on Windows and libldap on Linux
+    * CLI flags: --ad-server, --ad-domain, --ad-admin-group, --ldap-server,
+      --ldap-port, --ldap-ssl, --ldap-base-dn, --ldap-admin-group
+    * Fallback to local accounts if directory service is unreachable or disabled.
+
+* Enterprise Kerberos v5 / SPNEGO Single Sign-On (SSO):
+  - Integrated enterprise Kerberos ticket verification:
+    * Detects ASN.1 GSSAPI / SPNEGO initial context tokens (0x60, 0xa0, 0x6e)
+    * Validates service tickets against realm and service principal
+    * Assigns authenticated database user identity and ADMIN/READ_ONLY role
+    * Cross-platform: Windows SSPI / Kerberos SSP and POSIX GSSAPI keytab validation
+    * CLI flags: --krb-realm, --krb-service, --krb-keytab
+
+
+2. PERFORMANCE, ENGINE OPTIMIZATION & RESOURCE GOVERNANCE
+--------------------------------------------------------------------------------
+* Scalar Vector Quantization (SQ8):
+  - Defined VectorSQ8 data representation compressing 32-bit floating point vector
+    dimensions into 8-bit signed quantized integers (int8_t in [-127, 127]):
+    * Reduces raw vector in-memory footprint by 75%.
+    * Implemented vector_quantize_sq8() for dynamic scale compression.
+    * Implemented vector_sq8_cosine_distance() and vector_sq8_l2_distance()
+      utilizing integer multiply-accumulate (MAC) arithmetic before scaling.
+    * Delivers high-throughput similarity calculation with minimal recall loss.
+
+* Query Timeout Watchdog (statement_timeout):
+  - Added cooperative execution deadline watchdog:
+    * Samples monotonic clock during sequential table scans, joins, tuple
+      emission, and batch DML updates/deletes.
+    * Aborts runaway or pathological queries exceeding the configured deadline
+      with "ERROR: statement timeout exceeded (<ms> ms)".
+    * Preserves transaction consistency and prevents unindexed table scans from
+      starving concurrent connections.
+    * Configurable via CLI (--statement-timeout <ms>) and SQL (SET STATEMENT_TIMEOUT <ms>;).
+
+* Autonomous Background Vacuum Scheduler:
+  - Implemented background table catalog sweep and fragmentation compaction:
+    * Monitors deleted-row bloat metrics (deleted_rows / total_rows >= 0.20).
+    * Automatically triggers non-blocking vacuum sweeps during scheduler idle intervals.
+    * Reclaims physical slotted page fragmentation and reorganizes B+ trees.
+    * Configurable via CLI (--auto-vacuum, --no-auto-vacuum) and SQL (SET AUTO_VACUUM ON|OFF;).
+
+
+3. SECURITY HARDENING, DEFECT & MEMORY LEAK RECTIFICATIONS
+--------------------------------------------------------------------------------
+* JSON Parsing Buffer Overflow Defenses:
+  - Hardened json_extract_path() and json_value() with strict bounds checking.
+  - Eliminated potential buffer overflows on deeply nested or malformed JSON payloads.
+
+* Prepared Statement Parameter Boundary & Escape Processing:
+  - Enforced strict parameter index validation (param_idx <= stmt->param_count)
+    across all opendata_bind_*() API functions.
+  - Fixed SQL tokenizer quote escaping to correctly treat paired apostrophes ('')
+    inside string literals, preventing parameter isolation and injection defects.
+
+* Network Role Privilege Enforcement:
+  - Verified and hardened READ_ONLY vs ADMIN network session authorization.
+  - Disallowed execution of unauthorized administrative or DDL statements over
+    network sockets by READ_ONLY connections.
+
+* Memory Leak Fixes:
+  - Fixed memory deallocation paths in directory authentication and Kerberos
+    credential handles.
+  - Ensured all temporary AST nodes and token buffers are cleanly disposed in
+    nested window and JSON expression evaluators.
+
+* Compiler Diagnostics & Compliance:
+  - Achieved clean compilation under ISO C11 with zero warnings under:
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror.
+
+
+4. NEW SQL SYNTAX & CLI FLAGS REFERENCE
+--------------------------------------------------------------------------------
+* New SQL Statements & Directives:
+  - CREATE INDEX <name> ON <table> USING HNSW (<col>);
+  - ROW_NUMBER() / RANK() / DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...);
+  - col->'key' / col->>'key' / JSON_VALUE(col, 'path') / JSON_EXTRACT(col, 'path');
+  - SET STATEMENT_TIMEOUT <ms>;
+  - SET AUTO_VACUUM ON | OFF;
+
+* New CLI Options:
+  - --statement-timeout <ms>     Set global statement execution timeout in ms
+  - --auto-vacuum                Enable background vacuum scheduler (default)
+  - --no-auto-vacuum             Disable background vacuum scheduler
+  - --krb-realm <realm>          Kerberos realm name
+  - --krb-service <service>      Kerberos service principal name
+  - --krb-keytab <path>          Kerberos keytab file path
+  - --ad-server <host>           Active Directory domain controller IP/hostname
+  - --ad-domain <domain>         Active Directory domain name
+  - --ad-admin-group <grp>       Active Directory security group for ADMIN role
+  - --ldap-server <host>         LDAP server hostname/IP
+  - --ldap-port <port>           LDAP server port (389 or 636)
+  - --ldap-ssl                   Enable LDAPS SSL encryption
+  - --ldap-base-dn <dn>          LDAP user search base DN
+  - --ldap-admin-group <grp>     LDAP security group for ADMIN role
+  - --install-service [name]     Register Windows background service
+  - --uninstall-service [name]   Unregister Windows background service
+  - --start-service [name]       Start Windows background service
+  - --stop-service [name]        Stop Windows background service
+  - --pitr <unix_timestamp>      Point-in-time recovery target timestamp
+
+
+5. TOOLING, INSTALLER & DOCUMENTATION UPDATES
+--------------------------------------------------------------------------------
+* Amalgamated Distribution:
+  - Generated and verified monolithic C source file (src/opendata.c) combining
+    all 34 modular translation units into a single portable C11 file.
+
+* System-Wide Windows Installer:
+  - Updated installer/OpenDataSQL-Setup.zip containing the newly compiled
+    release binary (bin/opendata.exe), installation scripts (install.ps1,
+    install.bat, install-elevate.ps1), and documentation.
+
+* Test Suite (tests/test_new_features.c):
+  - Added comprehensive automated test suite covering:
+    1. Window Functions (DENSE_RANK, PARTITION BY, resets)
+    2. JSON Path Extraction (->, ->>, JSON_VALUE)
+    3. HNSW Vector Indexing & Approximate Nearest Neighbor search
+    4. Continuous WAL Archiving & Point-In-Time Recovery (PITR)
+    5. Tokenizer & Operator Kind Verification
+    6. LDAP & Active Directory Integration Configuration
+    7. Security & Robustness Edge Cases
+    8. Prepared Statement Template & Escaped Quotes
+    9. Recommendations 1 - 4 (Timeout Watchdog, SQ8 Quantization,
+       Auto-Vacuum Sweeper, Kerberos Ticket Validation).
+    10. Oracle & Microsoft SQL Server Compatibility (schema qualifications,
+        T-SQL TOP / ISNULL, Oracle NVL2 / TO_CHAR / ROWNUM, and DDL types).
+  - All tests passing with 100% success rate.
+
+
+6. MICROSOFT SQL SERVER & ORACLE DATABASE COMPATIBILITY ENHANCEMENTS
+--------------------------------------------------------------------------------
+* Multi-Part Schema Namespaces:
+  - Implemented automatic resolution of schema-qualified identifiers:
+    * Supported in CREATE TABLE: CREATE TABLE [dbo].[Orders] (...), hr.employees
+    * Supported in INSERT INTO: INSERT INTO [dbo].[Orders] VALUES (...)
+    * Supported in SELECT ... FROM: SELECT * FROM [dbo].[Orders], FROM hr.employees
+    * Supported in JOINs, ALTER TABLE, and TRUNCATE TABLE.
+    * Transparently matches qualified or unqualified catalog table entries.
+
+* Enterprise DDL Data Types:
+  - Added native support for Microsoft SQL Server data types:
+    * UNIQUEIDENTIFIER (UUID / GUID) mapped to durable 36-byte VARCHAR2.
+    * VARBINARY(n), VARBINARY(MAX), BINARY, IMAGE binary storage types.
+    * XML semi-structured document columns.
+  - Added native support for Oracle Database data types:
+    * ROWID and UROWID physical/logical row identifiers (18 bytes).
+    * VARCHAR2(n BYTE) and VARCHAR2(n CHAR) length semantics.
+
+* T-SQL (Microsoft SQL Server) Query Syntaxes & Functions:
+  - Added SELECT TOP <n> and SELECT TOP (<n>) query limit parsing.
+  - Added ISNULL(check_expr, replacement_value) alias for COALESCE/NVL.
+  - Added GETDATE() and NOW() current timestamp scalar evaluators for both
+    tableless and table-backed projections.
+  - Added CAST(expr AS target_type) data conversion expressions.
+
+* Oracle Database Query Syntaxes & Functions:
+  - Added support for Oracle's ROWNUM pseudo-column:
+    * SELECT ROWNUM, ... maps to 1-based row counter.
+    * WHERE ROWNUM <= <n> and WHERE ROWNUM < <n> mapped directly to execution
+      limit watchdogs for sub-millisecond query bounds.
+  - Added NVL2(expr, not_null_val, null_val) ternary null replacement.
+  - Added TO_CHAR(), TO_NUMBER(), and TO_DATE() scalar conversion functions.
+
+* Batch Script Pipeline Hardening:
+  - In import_database_external_file(), statements terminated by GO (MSSQL) or
+    / (Oracle) are automatically flushed and executed without requiring trailing
+    semicolons, enabling direct execution of enterprise SQL Server and Oracle
+    database schema scripts.
+
+* Documentation:
+  - Fully updated README.md and user_guide.md detailing all newly implemented
+    subsystems, commands, configuration switches, and architectural highlights.
+================================================================================

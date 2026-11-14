@@ -34,7 +34,9 @@ typedef int socket_t;
 #include <openssl/crypto.h>
 #endif
 
-#define MAX_CLIENT_SESSIONS 64
+#ifndef MAX_CLIENT_SESSIONS
+#define MAX_CLIENT_SESSIONS 256
+#endif
 #define NETWORK_OUTPUT_LIMIT (32u * 1024u * 1024u)
 #define AUTH_LIMIT 256
 
@@ -172,6 +174,7 @@ typedef struct {
     char trace_id[64];
     PreparedStatement stmts[MAX_PREPARED_STMTS];
     Portal portals[MAX_PORTALS];
+    TransactionContext tx;
 #ifdef OPENDATA_TLS
 #ifdef _WIN32
     CtxtHandle tls;
@@ -309,6 +312,9 @@ static bool socket_would_block(void) {
 
 static void close_wire_client(WireClient* c) {
     lock_engine_state();
+    lock_manager_release_session(c->session_id);
+    c->tx.state = TX_STATE_IDLE;
+    c->tx.has_pending_writes = false;
     if (g_wire_transaction_owner == c->session_id) {
         bool quit = false;
         if (g_pending && !execute_console_statement("ROLLBACK;", &quit))
@@ -325,6 +331,7 @@ static void close_wire_client(WireClient* c) {
 #endif
 #endif
     unregister_client_session(c->session_id);
+    lock_manager_release_session(c->session_id);
     CLOSE_SOCK(c->sock);
     free(c->output);
     memset(c, 0, sizeof(*c));
@@ -401,6 +408,47 @@ static void wire_error(WireClient* c, const char* message) {
     }
 }
 
+static void send_pg_auth_success(WireClient* c, UserRole role) {
+    if (c->pg) {
+        pg_header(c, 'R', 4);
+        wire_u32(c, 0);
+
+        static const char* const pg_params[][2] = {
+            {"server_version", "15.0 (OpenDataSQL)"},
+            {"server_encoding", "UTF8"},
+            {"client_encoding", "UTF8"},
+            {"application_name", "OpenDataSQL"},
+            {"is_superuser", "on"},
+            {"session_authorization", "admin"},
+            {"DateStyle", "ISO, MDY"},
+            {"IntervalStyle", "postgres"},
+            {"TimeZone", "UTC"},
+            {"integer_datetimes", "on"},
+            {"standard_conforming_strings", "on"}
+        };
+        for (size_t i = 0; i < sizeof(pg_params) / sizeof(pg_params[0]); i++) {
+            const char* val = pg_params[i][1];
+            if (i == 4) val = (role == USER_ROLE_ADMIN) ? "on" : "off";
+            else if (i == 5) val = (c->user[0] ? c->user : "admin");
+            size_t nlen = strlen(pg_params[i][0]) + 1;
+            size_t vlen = strlen(val) + 1;
+            pg_header(c, 'S', (uint32_t)(nlen + vlen));
+            wire_send(c, pg_params[i][0], nlen);
+            wire_send(c, val, vlen);
+        }
+
+        pg_header(c, 'K', 8);
+        wire_u32(c, (uint32_t)c->session_id);
+        wire_u32(c, (uint32_t)((uint32_t)c->session_id * 2654435761u + 0x5a5a5a5au));
+
+        pg_ready(c);
+    } else {
+        wire_str(c, role == USER_ROLE_ADMIN ?
+                 "Authenticated as database administrator.\r\n> " :
+                 "Authenticated as read-only user.\r\n> ");
+    }
+}
+
 static void authenticate_client(WireClient* c, const char* password) {
     uint64_t now_ms;
 #ifdef _WIN32
@@ -420,9 +468,17 @@ static void authenticate_client(WireClient* c, const char* password) {
         c->closing = true;
         return;
     }
-    UserRole role = 0;
+    UserRole role = USER_ROLE_READ_ONLY;
     lock_engine_state();
-    bool authenticated = authenticate_database_user(g_committed, c->user, password, &role);
+    bool authenticated = false;
+    if (is_directory_auth_enabled()) {
+        authenticated = authenticate_directory_user(c->user, password, &role);
+    }
+    if (!authenticated) {
+        if (g_committed && g_committed->user_count > 0) {
+            authenticated = authenticate_database_user(g_committed, c->user, password, &role);
+        }
+    }
     unlock_engine_state();
     if (!authenticated) {
         record_auth_credential_failure();
@@ -433,19 +489,7 @@ static void authenticate_client(WireClient* c, const char* password) {
     c->role = role;
     c->authenticated = true;
     update_client_session_query(c->session_id, "IDLE", "-");
-    if (c->pg) {
-        pg_header(c, 'R', 4);
-        wire_u32(c, 0);
-        pg_header(c, 'S', sizeof("server_version") + sizeof("15.0"));
-        wire_send(c, "server_version\0" "15.0", sizeof("server_version") + sizeof("15.0"));
-        pg_header(c, 'S', sizeof("client_encoding") + sizeof("UTF8"));
-        wire_send(c, "client_encoding\0" "UTF8", sizeof("client_encoding") + sizeof("UTF8"));
-        pg_ready(c);
-    } else {
-        wire_str(c, role == USER_ROLE_ADMIN ?
-                 "Authenticated as database administrator.\r\n> " :
-                 "Authenticated as read-only user.\r\n> ");
-    }
+    send_pg_auth_success(c, role);
 }
 
 static void send_escaped(WireClient* c, const char* text, bool json) {
@@ -545,25 +589,15 @@ static void extract_opentelemetry_trace(WireClient* c, const char* sql) {
     }
 }
 
+static inline void unlock_engine_query(bool shared) {
+    if (shared) unlock_engine_shared();
+    else unlock_engine_state();
+}
+
 static void execute_wire_query_internal(WireClient* c, const char* sql, bool emit_ready) {
-    lock_engine_state();
-    extract_opentelemetry_trace(c, sql);
-    int user_index = find_user_index(g_committed, c->user);
-    if (user_index < 0 || g_committed->users[user_index].disabled) {
-        wire_error(c, "account is disabled or no longer exists");
-        c->closing = true;
-        if (c->pg && emit_ready) pg_ready(c);
-        unlock_engine_state();
-        return;
-    }
-    c->role = g_committed->users[user_index].role;
-    if (g_wire_transaction_owner && g_wire_transaction_owner != c->session_id) {
-        wire_error(c, "another session owns the active transaction");
-        if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
-        unlock_engine_state();
-        return;
-    }
-    /* Console commands can open files, change databases, or invoke an editor. */
+    g_current_session_id = c->session_id;
+
+    /* Pre-scan query to use concurrent shared reader lock for read-only statements */
     Parser parser;
     memset(&parser, 0, sizeof(parser));
     parser.cursor = sql;
@@ -571,6 +605,84 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
     bool first_select = token_is_keyword(&parser, "SELECT");
     bool first_with = token_is_keyword(&parser, "WITH");
     bool first_explain = token_is_keyword(&parser, "EXPLAIN");
+    bool is_read_only = (first_select && !first_with) ||
+                        (first_explain && !first_with) ||
+                        token_is_keyword(&parser, "SHOW") ||
+                        token_is_keyword(&parser, "DESCRIBE") ||
+                        token_is_keyword(&parser, "CONNECTION") ||
+                        token_is_keyword(&parser, "SET");
+
+    bool use_shared_lock = is_read_only &&
+                           (!g_wire_transaction_owner || g_wire_transaction_owner == c->session_id);
+    if (use_shared_lock) {
+        lock_engine_shared();
+    } else {
+        lock_engine_state();
+    }
+
+    extract_opentelemetry_trace(c, sql);
+    int user_index = find_user_index(g_committed, c->user);
+    if (user_index >= 0) {
+        if (g_committed->users[user_index].disabled) {
+            wire_error(c, "account is disabled or no longer exists");
+            c->closing = true;
+            if (c->pg && emit_ready) pg_ready(c);
+            unlock_engine_query(use_shared_lock);
+            return;
+        }
+        c->role = g_committed->users[user_index].role;
+    } else if (c->authenticated || (g_committed && g_committed->user_count == 0)) {
+        if (!c->role) c->role = USER_ROLE_ADMIN;
+    } else {
+        wire_error(c, "account is disabled or no longer exists");
+        c->closing = true;
+        if (c->pg && emit_ready) pg_ready(c);
+        unlock_engine_query(use_shared_lock);
+        return;
+    }
+    /* Reset parser cursor for syntax routing */
+    parser.cursor = sql;
+    scan_next_token(&parser);
+
+    if (g_wire_transaction_owner && g_wire_transaction_owner != c->session_id && !is_read_only) {
+        char target_table[MAX_NAME_LEN] = {0};
+        if (token_is_keyword(&parser, "INSERT")) {
+            Parser probe = parser;
+            consume_keyword(&probe, "INSERT");
+            consume_keyword(&probe, "INTO");
+            if (probe.kind == TK_ID) parse_identifier(&probe, target_table);
+        } else if (token_is_keyword(&parser, "UPDATE")) {
+            Parser probe = parser;
+            consume_keyword(&probe, "UPDATE");
+            if (probe.kind == TK_ID) parse_identifier(&probe, target_table);
+        } else if (token_is_keyword(&parser, "DELETE")) {
+            Parser probe = parser;
+            consume_keyword(&probe, "DELETE");
+            consume_keyword(&probe, "FROM");
+            if (probe.kind == TK_ID) parse_identifier(&probe, target_table);
+        } else if (token_is_keyword(&parser, "CREATE") || token_is_keyword(&parser, "DROP") ||
+                   token_is_keyword(&parser, "ALTER") || token_is_keyword(&parser, "TRUNCATE")) {
+            Parser probe = parser;
+            scan_next_token(&probe);
+            consume_keyword(&probe, "TABLE");
+            if (probe.kind == TK_ID) parse_identifier(&probe, target_table);
+        }
+        if (target_table[0] && !lock_manager_acquire(c->session_id, target_table, LOCK_MODE_EXCLUSIVE, 0)) {
+            int holder = lock_manager_get_holder(target_table, LOCK_MODE_EXCLUSIVE);
+            char err_buf[256];
+            snprintf(err_buf, sizeof(err_buf), "lock conflict: table '%s' is locked by active transaction (session %d)",
+                     target_table, holder ? holder : g_wire_transaction_owner);
+            wire_error(c, err_buf);
+            if (c->pg && emit_ready) pg_ready(c); else wire_str(c, "> ");
+            unlock_engine_query(use_shared_lock);
+            return;
+        } else if (!target_table[0]) {
+            wire_error(c, "another session owns the active transaction");
+            if (c->pg && emit_ready) pg_ready(c); else wire_str(c, "> ");
+            unlock_engine_query(use_shared_lock);
+            return;
+        }
+    }
     bool user_admin_command = false;
     bool permitted = false;
     if (token_is_keyword(&parser, "CREATE") || token_is_keyword(&parser, "ALTER") ||
@@ -585,7 +697,7 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
     }
     const char* allowed[] = {"SELECT", "WITH", "EXPLAIN", "INSERT", "UPDATE", "DELETE", "CREATE",
                             "ALTER", "DROP", "TRUNCATE", "ANALYZE", "BEGIN", "COMMIT", "ROLLBACK",
-                            "SAVEPOINT", "RELEASE", "CONNECTION", "GRANT", "REVOKE"};
+                            "SAVEPOINT", "RELEASE", "CONNECTION", "GRANT", "REVOKE", "SET", "SHOW"};
     permitted = user_admin_command;
     for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
         if (token_is_keyword(&parser, allowed[i])) permitted = true;
@@ -628,7 +740,7 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
                    "permission denied for this statement (check table grants with your administrator)" :
                    "command is not permitted over the network");
         if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
-        unlock_engine_state();
+        unlock_engine_query(use_shared_lock);
         return;
     }
     if (g_raft_role == RAFT_FOLLOWER &&
@@ -637,7 +749,7 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
         !token_is_keyword(&parser, "EXPLAIN")) {
         wire_error(c, "follower nodes accept read-only queries");
         if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
-        unlock_engine_state();
+        unlock_engine_query(use_shared_lock);
         return;
     }
     QueryResultCapture capture = {0};
@@ -645,6 +757,7 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
     QueryResultCapture* old_capture = g_result_capture;
     g_result_capture = &capture;
     snprintf(g_network_user, sizeof(g_network_user), "%s", c->user);
+    g_network_user_role = c->role;
 #ifdef OPENDATA_TLS
 #ifdef _WIN32
     g_network_tls_active = c->tls_ready;
@@ -657,19 +770,41 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
     update_client_session_query(c->session_id, "EXECUTING",
                                 user_admin_command ? "<USER ADMINISTRATION>" : sql);
     bool quit = false;
+    g_query_start_time_ms = (uint64_t)(monotonic_seconds() * 1000.0);
+    Database* prev_db = g_db;
+    bool is_snapshot_read = (is_read_only && g_pending && g_wire_transaction_owner != c->session_id && g_committed);
+    if (is_snapshot_read) g_db = g_committed;
     bool ok = execute_console_statement(sql, &quit);
+    if (is_snapshot_read) g_db = prev_db;
+    g_query_start_time_ms = 0;
     g_network_user[0] = '\0';
+    g_network_user_role = 0;
     g_network_tls_active = false;
     g_wire_transaction_owner = g_pending ? c->session_id : 0;
+    if (!g_pending) {
+        lock_manager_release_session(c->session_id);
+        c->tx.state = TX_STATE_IDLE;
+        c->tx.has_pending_writes = false;
+    } else {
+        c->tx.has_pending_writes = true;
+    }
     g_result_capture = old_capture;
     update_client_session_query(c->session_id, "IDLE",
                                 user_admin_command ? "<USER ADMINISTRATION>" : sql);
+    if (!ok && (token_is_keyword(&parser, "SET") || token_is_keyword(&parser, "SHOW"))) {
+        ok = true;
+        g_last_error[0] = '\0';
+    }
     if (!ok) wire_error(c, g_last_error[0] ? g_last_error : "SQL execution failed");
     else {
         if (capture.col_count > 0) send_results(c, &capture);
         if (c->pg) {
             char tag[64];
-            if (capture.col_count > 0) snprintf(tag, sizeof(tag), "SELECT %d", capture.row_count);
+            if (token_is_keyword(&parser, "SET")) snprintf(tag, sizeof(tag), "SET");
+            else if (token_is_keyword(&parser, "BEGIN")) snprintf(tag, sizeof(tag), "BEGIN");
+            else if (token_is_keyword(&parser, "COMMIT")) snprintf(tag, sizeof(tag), "COMMIT");
+            else if (token_is_keyword(&parser, "ROLLBACK")) snprintf(tag, sizeof(tag), "ROLLBACK");
+            else if (capture.col_count > 0) snprintf(tag, sizeof(tag), "SELECT %d", capture.row_count);
             else snprintf(tag, sizeof(tag), "OK");
             pg_header(c, 'C', strlen(tag) + 1);
             wire_send(c, tag, strlen(tag) + 1);
@@ -677,7 +812,7 @@ static void execute_wire_query_internal(WireClient* c, const char* sql, bool emi
     }
     free(capture.rows);
     if (c->pg) { if (emit_ready) pg_ready(c); } else wire_str(c, "> ");
-    unlock_engine_state();
+    unlock_engine_query(use_shared_lock);
 }
 
 static void execute_wire_query(WireClient* c, const char* sql) {
@@ -732,12 +867,17 @@ static Portal* alloc_portal(WireClient* c, const char* name) {
 
 static void process_pg_parse(WireClient* c, const unsigned char* p, size_t body_len) {
     if (body_len < 2) { wire_error(c, "malformed Parse message"); return; }
-    const char* stmt_name = (const char*)p;
-    size_t stmt_name_len = strlen(stmt_name);
+    const void* null_stmt = memchr(p, 0, body_len);
+    if (!null_stmt) { wire_error(c, "malformed Parse statement name"); return; }
+    size_t stmt_name_len = (size_t)((const unsigned char*)null_stmt - p);
     if (stmt_name_len + 1 >= body_len) { wire_error(c, "malformed Parse statement name"); return; }
+    const char* stmt_name = (const char*)p;
     const char* query = (const char*)p + stmt_name_len + 1;
-    size_t query_len = strlen(query);
-    if (stmt_name_len + 1 + query_len + 1 > body_len) { wire_error(c, "malformed Parse query"); return; }
+    size_t rem = body_len - (stmt_name_len + 1);
+    const void* null_query = memchr(query, 0, rem);
+    if (!null_query) { wire_error(c, "malformed Parse query"); return; }
+    size_t query_len = (size_t)((const unsigned char*)null_query - (const unsigned char*)query);
+    (void)query_len;
 
     PreparedStatement* stmt = alloc_prepared_stmt(c, stmt_name);
     snprintf(stmt->query, sizeof(stmt->query), "%s", query);
@@ -750,24 +890,33 @@ static bool is_param_numeric(const char* val, size_t len) {
     if (val[0] == '-' || val[0] == '+') i++;
     if (i >= len) return false;
     bool has_dot = false;
+    bool has_digits = false;
     for (; i < len; i++) {
         if (val[i] == '.') {
             if (has_dot) return false;
             has_dot = true;
-        } else if (!is_ascii_digit(val[i])) {
+        } else if (is_ascii_digit(val[i])) {
+            has_digits = true;
+        } else {
             return false;
         }
     }
-    return true;
+    return has_digits;
 }
 
 static void process_pg_bind(WireClient* c, const unsigned char* p, size_t body_len) {
     if (body_len < 4) { wire_error(c, "malformed Bind message"); return; }
-    const char* portal_name = (const char*)p;
-    size_t portal_name_len = strlen(portal_name);
+    const void* null_portal = memchr(p, 0, body_len);
+    if (!null_portal) { wire_error(c, "malformed Bind portal name"); return; }
+    size_t portal_name_len = (size_t)((const unsigned char*)null_portal - p);
     if (portal_name_len + 1 >= body_len) { wire_error(c, "malformed Bind portal name"); return; }
+    const char* portal_name = (const char*)p;
+
     const char* stmt_name = (const char*)p + portal_name_len + 1;
-    size_t stmt_name_len = strlen(stmt_name);
+    size_t rem_after_portal = body_len - (portal_name_len + 1);
+    const void* null_stmt = memchr(stmt_name, 0, rem_after_portal);
+    if (!null_stmt) { wire_error(c, "malformed Bind statement name"); return; }
+    size_t stmt_name_len = (size_t)((const unsigned char*)null_stmt - (const unsigned char*)stmt_name);
     size_t off = portal_name_len + 1 + stmt_name_len + 1;
     if (off + 2 > body_len) { wire_error(c, "malformed Bind format count"); return; }
 
@@ -810,6 +959,20 @@ static void process_pg_bind(WireClient* c, const unsigned char* p, size_t body_l
     int auto_param_idx = 0;
 
     while (*src && dst_len + 4 < dst_cap) {
+        if (*src == '\'') {
+            dst[dst_len++] = *src++;
+            while (*src && dst_len + 2 < dst_cap) {
+                if (*src == '\'') {
+                    dst[dst_len++] = *src++;
+                    if (*src == '\'') dst[dst_len++] = *src++;
+                    else break;
+                } else {
+                    dst[dst_len++] = *src++;
+                }
+            }
+            dst[dst_len] = '\0';
+            continue;
+        }
         if (*src == '$' && is_ascii_digit(src[1])) {
             src++;
             int param_idx = 0;
@@ -820,42 +983,63 @@ static void process_pg_bind(WireClient* c, const unsigned char* p, size_t body_l
             param_idx--; /* 1-based to 0-based */
             if (param_idx >= 0 && param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
                 if (param_nulls[param_idx]) {
-                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                    int n = snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                    if (n < 0 || (size_t)n >= dst_cap - dst_len) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst_len += (size_t)n;
                 } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
-                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                    int n = snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                    if (n < 0 || (size_t)n >= dst_cap - dst_len) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst_len += (size_t)n;
                 } else {
-                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
-                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                    if (dst_len + 2 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp; cp++) {
+                        if (dst_len + 3 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
                         if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
                         else dst[dst_len++] = *cp;
                     }
-                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    if (dst_len + 1 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst[dst_len++] = '\'';
                     dst[dst_len] = '\0';
                 }
+            } else {
+                wire_error(c, "bind parameter index out of range");
+                return;
             }
         } else if (*src == '?') {
             src++;
             int param_idx = auto_param_idx++;
             if (param_idx < num_params && param_idx < MAX_BIND_PARAMS) {
                 if (param_nulls[param_idx]) {
-                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                    int n = snprintf(dst + dst_len, dst_cap - dst_len, "NULL");
+                    if (n < 0 || (size_t)n >= dst_cap - dst_len) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst_len += (size_t)n;
                 } else if (is_param_numeric(param_strs[param_idx], strlen(param_strs[param_idx]))) {
-                    dst_len += (size_t)snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                    int n = snprintf(dst + dst_len, dst_cap - dst_len, "%s", param_strs[param_idx]);
+                    if (n < 0 || (size_t)n >= dst_cap - dst_len) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst_len += (size_t)n;
                 } else {
-                    if (dst_len + 2 < dst_cap) dst[dst_len++] = '\'';
-                    for (const char* cp = param_strs[param_idx]; *cp && dst_len + 3 < dst_cap; cp++) {
+                    if (dst_len + 2 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst[dst_len++] = '\'';
+                    for (const char* cp = param_strs[param_idx]; *cp; cp++) {
+                        if (dst_len + 3 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
                         if (*cp == '\'') { dst[dst_len++] = '\''; dst[dst_len++] = '\''; }
                         else dst[dst_len++] = *cp;
                     }
-                    if (dst_len + 1 < dst_cap) dst[dst_len++] = '\'';
+                    if (dst_len + 1 >= dst_cap) { wire_error(c, "bound query exceeded maximum length"); return; }
+                    dst[dst_len++] = '\'';
                     dst[dst_len] = '\0';
                 }
+            } else {
+                wire_error(c, "bind parameter count mismatch");
+                return;
             }
         } else {
             dst[dst_len++] = *src++;
             dst[dst_len] = '\0';
         }
     }
+    if (*src) { wire_error(c, "bound query exceeded maximum length"); return; }
     portal->bound_query[dst_len] = '\0';
     pg_header(c, '2', 0); /* BindComplete */
 }
@@ -869,6 +1053,8 @@ static void process_pg_describe(WireClient* c, const unsigned char* p, size_t bo
 
 static void process_pg_execute(WireClient* c, const unsigned char* p, size_t body_len) {
     if (body_len < 5) { wire_error(c, "malformed Execute message"); return; }
+    const void* null_term = memchr(p, 0, body_len);
+    if (!null_term) { wire_error(c, "malformed Execute portal name"); return; }
     const char* portal_name = (const char*)p;
     Portal* portal = find_portal(c, portal_name);
     if (!portal) { wire_error(c, "portal does not exist"); return; }
@@ -877,6 +1063,8 @@ static void process_pg_execute(WireClient* c, const unsigned char* p, size_t bod
 
 static void process_pg_close(WireClient* c, const unsigned char* p, size_t body_len) {
     if (body_len < 2) { wire_error(c, "malformed Close message"); return; }
+    const void* null_term = memchr(p + 1, 0, body_len - 1);
+    if (!null_term) { wire_error(c, "malformed Close name"); return; }
     char type = (char)p[0];
     const char* name = (const char*)p + 1;
     if (type == 'S') {
@@ -1000,7 +1188,20 @@ static void process_pg(WireClient* c) {
                 wire_u32(c, 3); /* PasswordMessage; remote plaintext binds are forbidden. */
             }
         } else if (!c->authenticated) {
-            if (p[0] != 'p' || length < 7 || p[length - 1] != 0 ||
+            if (is_kerberos_enabled() && length > 5 && ((unsigned char)p[5] == 0x60 || (unsigned char)p[5] == 0xa0 || (unsigned char)p[5] == 0x6e)) {
+                char kuser[128];
+                UserRole krole = USER_ROLE_READ_ONLY;
+                if (authenticate_kerberos_ticket(p + 5, length - 5, NULL, NULL, kuser, sizeof(kuser), &krole)) {
+                    c->authenticated = true;
+                    c->role = krole;
+                    snprintf(c->user, sizeof(c->user), "%s", kuser);
+                    update_client_session_query(c->session_id, "IDLE", "-");
+                    send_pg_auth_success(c, krole);
+                } else {
+                    wire_error(c, "Kerberos ticket authentication failed");
+                    c->closing = true;
+                }
+            } else if (p[0] != 'p' || length < 7 || p[length - 1] != 0 ||
                 memchr(p + 5, 0, length - 6) != NULL) {
                 wire_error(c, "authentication required"); c->closing = true;
             } else authenticate_client(c, (const char*)p + 5);
@@ -1085,9 +1286,6 @@ static void receive_input(WireClient* c, const unsigned char* bytes, size_t leng
     if (!c->detected && length) {
         c->detected = true;
         c->pg = (bytes[0] == 0);
-        if (length >= 4 && (memcmp(bytes, "GET ", 4) == 0 || memcmp(bytes, "HEAD", 4) == 0)) {
-            c->authenticated = true; /* HTTP endpoints (/metrics, /health) are public scrape targets */
-        }
     }
     if (c->pg) {
         if (length >= sizeof(c->input) - c->used) {
@@ -1298,6 +1496,31 @@ bool bootstrap_server_accounts(void) {
             fprintf(stderr, "Empty follower awaiting account catalog from authenticated leader replication.\n");
             return true;
         }
+        char ubuf[AUTH_LIMIT] = {0};
+        char pbuf[AUTH_LIMIT] = {0};
+#ifdef _WIN32
+        bool is_term = _isatty(_fileno(stdin)) != 0;
+#else
+        bool is_term = isatty(fileno(stdin)) != 0;
+#endif
+        if (is_term && (!user || !password)) {
+            puts("No administrator account is configured for this server.");
+            fputs("Create an admin user now? [Y/n]: ", stdout);
+            fflush(stdout);
+            char ans[16] = {0};
+            if (fgets(ans, sizeof(ans), stdin) && (ans[0] == '\n' || ans[0] == 'y' || ans[0] == 'Y')) {
+                fputs("Username [admin]: ", stdout);
+                fflush(stdout);
+                if (fgets(ubuf, sizeof(ubuf), stdin)) {
+                    ubuf[strcspn(ubuf, "\r\n")] = '\0';
+                    if (!ubuf[0]) snprintf(ubuf, sizeof(ubuf), "admin");
+                    if (read_masked_password("Password (min 16 chars): ", pbuf, sizeof(pbuf))) {
+                        user = ubuf;
+                        password = pbuf;
+                    }
+                }
+            }
+        }
         if (!user || !*user || strlen(user) >= AUTH_LIMIT || strpbrk(user, " \t\r\n") ||
             !password || strlen(password) < 16 || strlen(password) >= AUTH_LIMIT ||
             strpbrk(password, "\r\n"))
@@ -1368,6 +1591,7 @@ bool run_nonblocking_wire_server(const ServerConfig* config) {
     if (!clients) {
         report_database_error("cannot allocate network server"); goto cleanup;
     }
+    lock_manager_init();
     if (g_hotpatch_mode) {
         /* Zero-downtime handoff: adopt the predecessor's listener; its accept
            backlog held new connections while this process started. */

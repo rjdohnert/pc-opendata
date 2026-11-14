@@ -154,7 +154,7 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
             char name[MAX_NAME_LEN];
             if (col_count == MAX_COLUMNS || !parse_identifier(p, name)) return false;
             int c = find_column_index(table, name);
-            if (c < 0) return report_database_error("column does not exist: %s", name);
+            if (c < 0) return report_column_not_found(table, name);
             for (int i = 0; i < col_count; i++)
                 if (col_indices[i] == c) return report_database_error("duplicate column in INSERT: %s", name);
             col_indices[col_count++] = c;
@@ -164,34 +164,78 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
         col_count = table->col_count;
         for (int c = 0; c < col_count; c++) col_indices[c] = c;
     }
-    if (!consume_keyword(p, "VALUES")) return false;
-
     int batch_cap = 16;
     int batch_count = 0;
-    Row* batch = calloc((size_t)batch_cap, sizeof(Row));
-    if (!batch) return report_database_error("out of memory");
+    Row* batch = NULL;
 
-    do {
-        if (!consume_token(p, TK_LP)) { free(batch); return false; }
-        Row* row = calloc(1, sizeof(Row));
-        if (!row) { free(batch); return report_database_error("out of memory"); }
-        for (int c = 0; c < table->col_count; c++) row->values[c].is_null = true;
-        for (int i = 0; i < col_count; i++) {
-            if (i && !consume_token(p, TK_COMMA)) { free(row); free(batch); return false; }
-            int c = col_indices[i];
-            if (!parse_typed_literal(p, &table->columns[c], &row->values[c])) { free(row); free(batch); return false; }
+    if (consume_keyword(p, "SELECT")) {
+        QueryResultCapture cap = {0};
+        cap.silent = true;
+        QueryResultCapture* old_cap = g_result_capture;
+        g_result_capture = &cap;
+        bool sel_ok = execute_select_query(p);
+        g_result_capture = old_cap;
+        if (!sel_ok) {
+            free(cap.rows);
+            return false;
         }
-        if (!consume_token(p, TK_RP)) { free(row); free(batch); return false; }
-        if (batch_count == batch_cap) {
-            int new_cap = batch_cap * 2;
-            Row* grown = realloc(batch, (size_t)new_cap * sizeof(Row));
-            if (!grown) { free(row); free(batch); return report_database_error("out of memory"); }
-            batch = grown;
-            batch_cap = new_cap;
+        if (cap.col_count != col_count) {
+            free(cap.rows);
+            return report_database_error("column count mismatch: expected %d, got %d", col_count, cap.col_count);
         }
-        batch[batch_count++] = *row;
-        free(row);
-    } while (consume_token(p, TK_COMMA));
+        batch_cap = cap.row_count > 0 ? cap.row_count : 1;
+        batch = calloc((size_t)batch_cap, sizeof(Row));
+        if (!batch) { free(cap.rows); return report_database_error("out of memory"); }
+        for (int r = 0; r < cap.row_count; r++) {
+            Row* row = &batch[batch_count++];
+            for (int c = 0; c < table->col_count; c++) {
+                if (table->columns[c].has_default) {
+                    row->values[c].is_null = false;
+                    snprintf(row->values[c].text, sizeof(row->values[c].text), "%s", table->columns[c].default_value);
+                } else {
+                    row->values[c].is_null = true;
+                }
+            }
+            for (int i = 0; i < col_count; i++) {
+                int c = col_indices[i];
+                row->values[c] = cap.rows[r][i];
+            }
+        }
+        free(cap.rows);
+    } else {
+        if (!consume_keyword(p, "VALUES")) return false;
+        batch = calloc((size_t)batch_cap, sizeof(Row));
+        if (!batch) return report_database_error("out of memory");
+
+        do {
+            if (!consume_token(p, TK_LP)) { free(batch); return false; }
+            Row* row = calloc(1, sizeof(Row));
+            if (!row) { free(batch); return report_database_error("out of memory"); }
+            for (int c = 0; c < table->col_count; c++) {
+                if (table->columns[c].has_default) {
+                    row->values[c].is_null = false;
+                    snprintf(row->values[c].text, sizeof(row->values[c].text), "%s", table->columns[c].default_value);
+                } else {
+                    row->values[c].is_null = true;
+                }
+            }
+            for (int i = 0; i < col_count; i++) {
+                if (i && !consume_token(p, TK_COMMA)) { free(row); free(batch); return false; }
+                int c = col_indices[i];
+                if (!parse_typed_literal(p, &table->columns[c], &row->values[c])) { free(row); free(batch); return false; }
+            }
+            if (!consume_token(p, TK_RP)) { free(row); free(batch); return false; }
+            if (batch_count == batch_cap) {
+                int new_cap = batch_cap * 2;
+                Row* grown = realloc(batch, (size_t)new_cap * sizeof(Row));
+                if (!grown) { free(row); free(batch); return report_database_error("out of memory"); }
+                batch = grown;
+                batch_cap = new_cap;
+            }
+            batch[batch_count++] = *row;
+            free(row);
+        } while (consume_token(p, TK_COMMA));
+    }
 
     bool has_upsert = false;
     bool do_nothing = false;
@@ -278,6 +322,25 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
 
     for (int b = 0; b < batch_count; b++) {
         Row* candidate = &batch[b];
+        for (int c = 0; c < table->col_count; c++) {
+            if (table->columns[c].auto_increment && candidate->values[c].is_null) {
+                long long max_val = 0;
+                for (int r = 0; r < table->row_count; r++) {
+                    if (!table->rows[r].values[c].is_null) {
+                        long long v = strtoll(table->rows[r].values[c].text, NULL, 10);
+                        if (v > max_val) max_val = v;
+                    }
+                }
+                for (int b2 = 0; b2 < b; b2++) {
+                    if (!batch[b2].values[c].is_null) {
+                        long long v = strtoll(batch[b2].values[c].text, NULL, 10);
+                        if (v > max_val) max_val = v;
+                    }
+                }
+                snprintf(candidate->values[c].text, sizeof(candidate->values[c].text), "%lld", max_val + 1);
+                candidate->values[c].is_null = false;
+            }
+        }
         int conflict_idx = has_upsert ? find_conflicting_row(table, candidate, conflict_cols, conflict_col_count) : -1;
         if (conflict_idx >= 0) {
             if (do_nothing) {
@@ -290,6 +353,8 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
             Row* existing_copy = malloc(sizeof(Row));
             if (!existing_copy) { free(upsert_assigns); free(batch); return report_database_error("out of memory"); }
             *existing_copy = table->rows[conflict_idx];
+            int t_idx = find_table_index(db, table->name);
+            undo_log_push_update(t_idx, conflict_idx, &table->rows[conflict_idx]);
             for (int a = 0; a < upsert_assign_count; a++) {
                 const UpsertAssignment* ua = &upsert_assigns[a];
                 int tc = ua->target_col;
@@ -352,7 +417,10 @@ bool execute_insert_row(Parser* p, Database* db, int* inserted) {
                 uint8_t slotted_buf[PAGE_SIZE];
                 encode_slotted_row(table->columns, table->col_count, candidate, slotted_buf, sizeof(slotted_buf));
             }
+            int t_idx = find_table_index(db, table->name);
+            int new_idx = table->row_count;
             table->rows[table->row_count++] = *candidate;
+            undo_log_push_insert(t_idx, new_idx);
             (*inserted)++;
         }
     }
@@ -492,12 +560,18 @@ bool execute_update_or_delete(Parser* p, Database* db, bool deleting, int* affec
         return report_database_error("unable to allocate row storage");
     }
     int write = 0; *affected = 0;
+    int t_idx = find_table_index(db, table->name);
     for (int r = 0; r < table->row_count; r++) {
+        if (is_query_timed_out()) {
+            free(filter); free(assignment_values);
+            return report_database_error("statement canceled due to timeout (%u ms)", g_statement_timeout_ms);
+        }
         scope.rows[0] = &table->rows[r];
         bool match = evaluate_where_clause(&scope, filter);
         if (match) (*affected)++;
         if (deleting) {
             if (match) {
+                undo_log_push_delete(t_idx, r, &table->rows[r]);
                 for (int c = 0; c < table->col_count; c++) {
                     if (!cascade_delete_parent_value(db, table->name, table->columns[c].name, &table->rows[r].values[c], 1)) {
                         free(filter); free(assignment_values);
@@ -508,6 +582,7 @@ bool execute_update_or_delete(Parser* p, Database* db, bool deleting, int* affec
                 table->rows[write++] = table->rows[r];
             }
         } else if (match) {
+            undo_log_push_update(t_idx, r, &table->rows[r]);
             for (int i = 0; i < assignments; i++) {
                 int c = assignment_columns[i];
                 Value old_val = table->rows[r].values[c];

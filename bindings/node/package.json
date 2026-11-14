@@ -1,0 +1,16 @@
+{
+  "name": "opendata-sql",
+  "version": "1.0.0",
+  "description": "Node.js driver for PC/OpenData SQL Server",
+  "main": "opendata.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "opendata",
+    "sql",
+    "database"
+  ],
+  "author": "PC/OpenSystems LLC",
+  "license": "BSD-3-Clause"
+}

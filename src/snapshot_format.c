@@ -5,7 +5,16 @@
 #else
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
 #endif
+
+static inline void secure_wipe(void* ptr, size_t size) {
+#ifdef _WIN32
+    SecureZeroMemory(ptr, size);
+#else
+    OPENSSL_cleanse(ptr, size);
+#endif
+}
 
 static bool derive_tde_raw_key(unsigned char key_bytes[32]) {
     if (!g_tde_enabled || !g_tde_key[0]) return false;
@@ -42,11 +51,15 @@ static bool tde_encrypt_image(Image* image) {
     unsigned char iv_copy[16];
     memcpy(iv_copy, iv, 16);
     if (BCryptEncrypt(key_h, image->data, (ULONG)image->size, NULL, iv_copy, 16, NULL, 0, &cipher_len, BCRYPT_BLOCK_PADDING) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false;
     }
     size_t total_enc_size = 8 + 16 + 4 + cipher_len;
     unsigned char* enc_data = malloc(total_enc_size);
-    if (!enc_data) { BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false; }
+    if (!enc_data) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
+        BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false;
+    }
     memcpy(enc_data, "PCODEN01", 8);
     memcpy(enc_data + 8, iv, 16);
     uint32_t orig_sz = (uint32_t)image->size;
@@ -57,24 +70,27 @@ static bool tde_encrypt_image(Image* image) {
     memcpy(iv_copy, iv, 16);
     ULONG written = 0;
     if (BCryptEncrypt(key_h, image->data, (ULONG)image->size, NULL, iv_copy, 16, enc_data + 28, cipher_len, &written, BCRYPT_BLOCK_PADDING) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(enc_data); BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0); return false;
     }
     BCryptDestroyKey(key_h);
     BCryptCloseAlgorithmProvider(alg, 0);
+    secure_wipe(key_bytes, sizeof(key_bytes));
     free(image->data);
     image->data = enc_data;
     image->size = image->capacity = total_enc_size;
     return true;
 #else
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
+    if (!ctx) { secure_wipe(key_bytes, sizeof(key_bytes)); return false; }
     RAND_bytes(iv, sizeof(iv));
     if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key_bytes, iv) != 1) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         EVP_CIPHER_CTX_free(ctx); return false;
     }
     size_t total_enc_size = 8 + 16 + 4 + image->size + 32;
     unsigned char* enc_data = malloc(total_enc_size);
-    if (!enc_data) { EVP_CIPHER_CTX_free(ctx); return false; }
+    if (!enc_data) { secure_wipe(key_bytes, sizeof(key_bytes)); EVP_CIPHER_CTX_free(ctx); return false; }
     memcpy(enc_data, "PCODEN01", 8);
     memcpy(enc_data + 8, iv, 16);
     uint32_t orig_sz = (uint32_t)image->size;
@@ -88,6 +104,7 @@ static bool tde_encrypt_image(Image* image) {
     EVP_EncryptFinal_ex(ctx, enc_data + 28 + total_cipher, &outlen);
     total_cipher += outlen;
     EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key_bytes, sizeof(key_bytes));
     free(image->data);
     image->data = enc_data;
     image->size = image->capacity = 28 + (size_t)total_cipher;
@@ -115,39 +132,49 @@ static bool tde_decrypt_image(Image* image) {
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE alg = NULL;
     BCRYPT_KEY_HANDLE key_h = NULL;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) { free(plain); return false; }
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, NULL, 0) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
+        free(plain); return false;
+    }
     if (BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC, sizeof(BCRYPT_CHAIN_MODE_CBC), 0) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(plain); BCryptCloseAlgorithmProvider(alg, 0); return false;
     }
     if (BCryptGenerateSymmetricKey(alg, &key_h, NULL, 0, key_bytes, 32, 0) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(plain); BCryptCloseAlgorithmProvider(alg, 0); return false;
     }
     ULONG plain_len = 0;
     unsigned char iv_copy[16];
     memcpy(iv_copy, iv, 16);
     if (BCryptDecrypt(key_h, (PUCHAR)cipher, (ULONG)cipher_len, NULL, iv_copy, 16, plain, orig_sz + 64, &plain_len, BCRYPT_BLOCK_PADDING) < 0) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(plain); BCryptDestroyKey(key_h); BCryptCloseAlgorithmProvider(alg, 0);
         report_database_error("TDE decryption failed: invalid encryption key");
         return false;
     }
     BCryptDestroyKey(key_h);
     BCryptCloseAlgorithmProvider(alg, 0);
+    secure_wipe(key_bytes, sizeof(key_bytes));
 #else
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) { free(plain); return false; }
+    if (!ctx) { secure_wipe(key_bytes, sizeof(key_bytes)); free(plain); return false; }
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key_bytes, iv) != 1) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(plain); EVP_CIPHER_CTX_free(ctx); return false;
     }
     int outlen = 0;
     EVP_DecryptUpdate(ctx, plain, &outlen, cipher, (int)cipher_len);
     int total_plain = outlen;
     if (EVP_DecryptFinal_ex(ctx, plain + total_plain, &outlen) != 1) {
+        secure_wipe(key_bytes, sizeof(key_bytes));
         free(plain); EVP_CIPHER_CTX_free(ctx);
         report_database_error("TDE decryption failed: invalid encryption key");
         return false;
     }
     total_plain += outlen;
     EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key_bytes, sizeof(key_bytes));
 #endif
     free(image->data);
     image->data = plain;

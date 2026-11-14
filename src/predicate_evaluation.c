@@ -1,6 +1,6 @@
 #include "database_engine.h"
 
-const Scope* g_outer_scope = NULL;
+THREAD_LOCAL const Scope* g_outer_scope = NULL;
 
 bool parse_column_reference(Parser* p, ColumnName* name) {
     memset(name, 0, sizeof(*name));
@@ -13,6 +13,11 @@ bool parse_column_reference(Parser* p, ColumnName* name) {
 }
 
 bool resolve_column_reference(const Scope* scope, const ColumnName* name, Binding* binding) {
+    if (!strcmp(name->column, "ROWNUM")) {
+        binding->table = 0;
+        binding->column = 0;
+        return true;
+    }
     int found = 0;
     for (int t = 0; t < scope->count; t++) {
         if (!scope->tables[t]) continue;
@@ -52,6 +57,25 @@ static bool match_like(const char* pat, const char* str) {
             wildcard = ++pat;
             retry = str;
         } else if (*pat == '_' || *pat == *str) {
+            pat++;
+            str++;
+        } else if (wildcard) {
+            pat = wildcard;
+            str = ++retry;
+        } else return false;
+    }
+    while (*pat == '%') pat++;
+    return *pat == '\0';
+}
+
+static bool match_ilike(const char* pat, const char* str) {
+    const char* wildcard = NULL;
+    const char* retry = NULL;
+    while (*str) {
+        if (*pat == '%') {
+            wildcard = ++pat;
+            retry = str;
+        } else if (*pat == '_' || uppercase_ascii(*pat) == uppercase_ascii(*str)) {
             pat++;
             str++;
         } else if (wildcard) {
@@ -110,6 +134,9 @@ bool parse_comparison_predicate(Parser* p, const Scope* scope, Predicate* pred) 
     } else {
         if (!parse_column_reference(p, &name) || !resolve_column_reference(scope, &name, &pred->left)) return false;
     }
+    if (!strcmp(name.column, "ROWNUM")) {
+        pred->is_rownum = true;
+    }
     bool outer_binding = (pred->left.table & 0x1000) != 0;
     const Scope* left_scope = outer_binding ? g_outer_scope : scope;
     int left_table = pred->left.table & ~0x1000;
@@ -143,7 +170,17 @@ bool parse_comparison_predicate(Parser* p, const Scope* scope, Predicate* pred) 
         pred->op = PRED_LIKE;
         pred->negate = neg;
         if (p->kind != TK_STRING) return false;
-        memcpy(pred->value.text, p->text, strlen(p->text) + 1);
+        if (strlen(p->text) >= sizeof(pred->value.text)) return false;
+        snprintf(pred->value.text, sizeof(pred->value.text), "%s", p->text);
+        scan_next_token(p);
+        return true;
+    }
+    if (consume_keyword(p, "ILIKE")) {
+        pred->op = PRED_ILIKE;
+        pred->negate = neg;
+        if (p->kind != TK_STRING) return false;
+        if (strlen(p->text) >= sizeof(pred->value.text)) return false;
+        snprintf(pred->value.text, sizeof(pred->value.text), "%s", p->text);
         scan_next_token(p);
         return true;
     }
@@ -325,6 +362,7 @@ bool evaluate_comparison_predicate(const Scope* scope, const Predicate* pred) {
         left = &eval_left;
     }
 
+    if (pred->is_rownum) return true;
     if (pred->is_null_test) return pred->negate ? !left->is_null : left->is_null;
     const Value* right = &null_val;
     if (pred->right_column) {
@@ -344,9 +382,10 @@ bool evaluate_comparison_predicate(const Scope* scope, const Predicate* pred) {
             g_outer_scope->tables[pred->left.table & ~0x1000]->columns[pred->left.column].type : TYPE_NUMBER) :
         ((pred->left.table < scope->count && scope->tables[pred->left.table]) ?
             scope->tables[pred->left.table]->columns[pred->left.column].type : TYPE_NUMBER));
-    if (pred->op == PRED_LIKE) {
+    if (pred->op == PRED_LIKE || pred->op == PRED_ILIKE) {
         if (left->is_null) return false;
-        bool match = match_like(pred->value.text, left->text);
+        bool match = (pred->op == PRED_ILIKE) ? match_ilike(pred->value.text, left->text)
+                                              : match_like(pred->value.text, left->text);
         return pred->negate ? !match : match;
     }
     if (pred->op == PRED_BETWEEN) {
@@ -381,18 +420,18 @@ bool evaluate_comparison_predicate(const Scope* scope, const Predicate* pred) {
     }
 }
 
-static bool eval_node(const Scope* scope, const Filter* f, int idx) {
-    if (idx < 0 || idx >= f->node_count) return true;
+static bool eval_node(const Scope* scope, const Filter* f, int idx, int depth) {
+    if (idx < 0 || idx >= f->node_count || depth > 128) return true;
     const FilterNode* n = &f->nodes[idx];
     switch (n->type) {
     case FILTER_NODE_PRED:
         return evaluate_comparison_predicate(scope, &n->pred);
     case FILTER_NODE_AND:
-        return eval_node(scope, f, n->left_child) && eval_node(scope, f, n->right_child);
+        return eval_node(scope, f, n->left_child, depth + 1) && eval_node(scope, f, n->right_child, depth + 1);
     case FILTER_NODE_OR:
-        return eval_node(scope, f, n->left_child) || eval_node(scope, f, n->right_child);
+        return eval_node(scope, f, n->left_child, depth + 1) || eval_node(scope, f, n->right_child, depth + 1);
     case FILTER_NODE_NOT:
-        return !eval_node(scope, f, n->left_child);
+        return !eval_node(scope, f, n->left_child, depth + 1);
     default:
         return false;
     }
@@ -400,5 +439,5 @@ static bool eval_node(const Scope* scope, const Filter* f, int idx) {
 
 bool evaluate_where_clause(const Scope* scope, const Filter* filter) {
     if (filter->node_count == 0 || filter->root < 0) return true;
-    return eval_node(scope, filter, filter->root);
+    return eval_node(scope, filter, filter->root, 0);
 }

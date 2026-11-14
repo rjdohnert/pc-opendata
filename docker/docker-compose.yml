@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  opendata:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opendata-server
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7338:7338"   # Authenticated TLS; expose externally only deliberately
+    volumes:
+      - opendata_data:/data
+      - opendata_backups:/backups
+      - ./tls:/run/tls:ro
+    environment:
+      # Required only when bootstrapping a new database or migrating a legacy snapshot.
+      OPENDATA_SERVER_USER: ${OPENDATA_SERVER_USER:-}
+      OPENDATA_SERVER_PASSWORD: ${OPENDATA_SERVER_PASSWORD:-}
+      OPENDATA_TLS_SERVER_NAME: ${OPENDATA_TLS_SERVER_NAME:-localhost}
+    command: >
+      --database /data/production.pcod
+      --backup-dir /backups
+      --backup-interval 60
+      --tcps
+      --bind 0.0.0.0
+      --port 7338
+      --cert /run/tls/server.pem
+      --key /run/tls/server-key.pem
+
+volumes:
+  opendata_data:
+    driver: local
+  opendata_backups:
+    driver: local

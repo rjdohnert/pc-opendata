@@ -1,10 +1,15 @@
 #include "database_engine.h"
 
 Database *g_db, *g_committed;
+THREAD_LOCAL int g_current_session_id = 1;
 bool g_pending, g_timing, g_io_uncertain, g_readonly;
+bool g_silent_mode = false;
 bool g_autocommit = false;
 bool g_interactive_shell = false;
+bool g_self_test_running = false;
+bool g_pager_enabled = true;
 bool g_semicolon_optional = false;
+bool g_confirm_destructive = true;
 char g_null_str[32] = "NULL";
 int g_max_rows = 0;
 FILE* g_spool_file = NULL;
@@ -13,9 +18,18 @@ OutputFormat g_output_format = FORMAT_TABLE;
 atomic_int g_errors;
 uint64_t g_generation, g_identity;
 char g_path[PATH_CAP], g_backup_dir[PATH_CAP];
-char g_network_user[MAX_NAME_LEN];
-bool g_network_tls_active;
-char g_last_error[MAX_VAL_LEN];
+THREAD_LOCAL char g_network_user[MAX_NAME_LEN];
+THREAD_LOCAL UserRole g_network_user_role = 0;
+THREAD_LOCAL bool g_network_tls_active;
+uint32_t g_statement_timeout_ms = 0;
+THREAD_LOCAL uint64_t g_query_start_time_ms = 0;
+
+bool is_query_timed_out(void) {
+    if (g_statement_timeout_ms == 0 || g_query_start_time_ms == 0) return false;
+    uint64_t now = (uint64_t)(monotonic_seconds() * 1000.0);
+    return (now >= g_query_start_time_ms && (now - g_query_start_time_ms) > (uint64_t)g_statement_timeout_ms);
+}
+THREAD_LOCAL char g_last_error[MAX_VAL_LEN];
 char g_tde_key[65] = {0};
 bool g_tde_enabled = false;
 
@@ -49,13 +63,17 @@ void lock_snapshot_io(void) { EnterCriticalSection(&g_io_lock); }
 void unlock_snapshot_io(void) { LeaveCriticalSection(&g_io_lock); }
 void lock_engine_state(void) { AcquireSRWLockExclusive(&g_engine_state_lock); }
 void unlock_engine_state(void) { ReleaseSRWLockExclusive(&g_engine_state_lock); }
+void lock_engine_shared(void) { AcquireSRWLockShared(&g_engine_state_lock); }
+void unlock_engine_shared(void) { ReleaseSRWLockShared(&g_engine_state_lock); }
 #else
 static pthread_mutex_t g_io_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_engine_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t g_engine_state_lock = PTHREAD_RWLOCK_INITIALIZER;
 void lock_snapshot_io(void) { pthread_mutex_lock(&g_io_lock); }
 void unlock_snapshot_io(void) { pthread_mutex_unlock(&g_io_lock); }
-void lock_engine_state(void) { pthread_mutex_lock(&g_engine_state_lock); }
-void unlock_engine_state(void) { pthread_mutex_unlock(&g_engine_state_lock); }
+void lock_engine_state(void) { pthread_rwlock_wrlock(&g_engine_state_lock); }
+void unlock_engine_state(void) { pthread_rwlock_unlock(&g_engine_state_lock); }
+void lock_engine_shared(void) { pthread_rwlock_rdlock(&g_engine_state_lock); }
+void unlock_engine_shared(void) { pthread_rwlock_unlock(&g_engine_state_lock); }
 #endif
 
 void initialize_snapshot_io(void) {
@@ -93,12 +111,14 @@ void shutdown_snapshot_io(void) {
 }
 
 bool report_database_error(const char* format, ...) {
-    va_list args;
-    fputs("ERROR: ", stderr);
-    va_start(args, format);
-    vfprintf(stderr, format, args);
-    va_end(args);
-    fputc('\n', stderr);
+    if (!g_silent_mode) {
+        va_list args;
+        fputs("ERROR: ", stderr);
+        va_start(args, format);
+        vfprintf(stderr, format, args);
+        va_end(args);
+        fputc('\n', stderr);
+    }
     if (g_spool_file) {
         va_list args2;
         fputs("ERROR: ", g_spool_file);

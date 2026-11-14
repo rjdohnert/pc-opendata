@@ -43,7 +43,7 @@ bool execute_savepoint(const char* name) {
     destroy_database(g_savepoints[idx].snapshot);
     snprintf(g_savepoints[idx].name, sizeof(g_savepoints[idx].name), "%s", name);
     g_savepoints[idx].snapshot = copy;
-    printf("Savepoint %s created.\n", name);
+    if (!g_silent_mode) printf("Savepoint %s created.\n", name);
     return true;
 }
 
@@ -65,13 +65,14 @@ bool execute_rollback_savepoint(const char* name) {
     if (!restored) return report_database_error("cannot allocate rollback snapshot");
     destroy_database(g_db);
     g_db = restored;
+    undo_log_clear();
 
     for (int i = idx + 1; i < g_savepoint_count; i++) {
         destroy_database(g_savepoints[i].snapshot);
         g_savepoints[i].snapshot = NULL;
     }
     g_savepoint_count = idx + 1;
-    printf("Rollback to savepoint %s complete.\n", name);
+    if (!g_silent_mode) printf("Rollback to savepoint %s complete.\n", name);
     return true;
 }
 
@@ -91,7 +92,7 @@ bool execute_release_savepoint(const char* name) {
         g_savepoints[i].snapshot = NULL;
     }
     g_savepoint_count = idx;
-    printf("Savepoint %s released.\n", name);
+    if (!g_silent_mode) printf("Savepoint %s released.\n", name);
     return true;
 }
 
@@ -100,7 +101,10 @@ bool commit_transaction(void) {
     if (g_readonly) return report_database_error("cannot commit in read-only mode");
     if (g_io_uncertain) return report_database_error("commit outcome uncertain; restart and inspect the database before writing");
     if (atomic_load(&g_backup_failed)) return report_database_error("backup unhealthy; run BACKUP before committing");
-    if (!g_pending) { puts("Commit complete. No pending changes."); return true; }
+    if (!g_pending) {
+        if (!g_silent_mode) puts("Commit complete. No pending changes.");
+        return true;
+    }
     if (g_generation == UINT64_MAX) return report_database_error("generation exhausted");
     for (int t = 0; t < g_db->table_count; t++) {
         Table* tbl = &g_db->tables[t];
@@ -144,7 +148,8 @@ bool commit_transaction(void) {
     destroy_database(g_committed); g_committed = committed;
     g_generation++; g_pending = false;
     clear_all_savepoints();
-    printf("Commit complete. Durable generation %llu.\n", (unsigned long long)g_generation);
+    undo_log_clear();
+    if (!g_silent_mode) printf("Commit complete. Durable generation %llu.\n", (unsigned long long)g_generation);
     return true;
 }
 
@@ -152,19 +157,32 @@ bool rollback_transaction(void) {
     if (g_readonly) return report_database_error("cannot rollback in read-only mode");
     if (g_io_uncertain) return report_database_error("commit outcome uncertain; restart required");
     if (!g_committed) return report_database_error("not connected to any database");
-    Database* restored = copy_database(g_committed);
-    if (!restored) return report_database_error("cannot allocate rollback state");
-    destroy_database(g_db); g_db = restored; g_pending = false;
+    if (g_undo_log.entry_count > 0 && g_db) {
+        undo_log_rollback_all(g_db);
+    } else {
+        Database* restored = copy_database(g_committed);
+        if (!restored) return report_database_error("cannot allocate rollback state");
+        destroy_database(g_db); g_db = restored;
+    }
     clear_all_savepoints();
-    puts("Rollback complete.");
+    g_pending = false;
+    if (!g_silent_mode) puts("Rollback complete.");
     return true;
 }
 
 bool execute_atomic_mutation(Parser* p, const char* command) {
     if (g_readonly) return report_database_error("database opened in read-only mode; mutations not allowed");
     if (g_io_uncertain || atomic_load(&g_backup_failed)) return report_database_error("writes blocked by storage/backup failure");
-    Database* candidate = copy_database(g_db);
-    if (!candidate) return report_database_error("unable to allocate statement snapshot");
+    bool is_dml = (!strcmp(command, "INSERT") || !strcmp(command, "UPDATE") || !strcmp(command, "DELETE"));
+    Database* candidate = NULL;
+    UndoEntry* undo_savepoint = NULL;
+    if (is_dml) {
+        candidate = g_db;
+        undo_savepoint = g_undo_log.head;
+    } else {
+        candidate = copy_database(g_db);
+        if (!candidate) return report_database_error("unable to allocate statement snapshot");
+    }
     int before_errors = g_errors, affected = 0;
     bool ok = false;
     bool is_index_create = false;
@@ -174,15 +192,58 @@ bool execute_atomic_mutation(Parser* p, const char* command) {
         if (token_is_keyword(p, "INDEX") || token_is_keyword(p, "UNIQUE")) {
             is_index_create = true;
             bool unique = consume_keyword(p, "UNIQUE");
-            char idx_name[MAX_NAME_LEN], tbl_name[MAX_NAME_LEN], col_name[MAX_NAME_LEN];
-            if (!consume_keyword(p, "INDEX") ||
-                !parse_identifier(p, idx_name) || !consume_keyword(p, "ON") ||
-                !parse_identifier(p, tbl_name) || !consume_token(p, TK_LP) ||
-                !parse_identifier(p, col_name) || !consume_token(p, TK_RP) ||
-                !consume_statement_end(p)) {
+            if (!consume_keyword(p, "INDEX")) {
                 ok = false;
             } else {
-                ok = execute_create_index_in_db(candidate, idx_name, tbl_name, col_name, unique);
+                ok = true;
+                bool if_not_exists = false;
+                if (consume_keyword(p, "IF")) {
+                    if (!consume_keyword(p, "NOT") || !consume_keyword(p, "EXISTS")) ok = false;
+                    else if_not_exists = true;
+                }
+                char idx_name[MAX_NAME_LEN], tbl_name[MAX_NAME_LEN], col_name[MAX_NAME_LEN];
+                bool is_hnsw = false;
+                int hnsw_metric = 0;
+                if (ok && (!parse_identifier(p, idx_name) || !consume_keyword(p, "ON") ||
+                           !parse_identifier(p, tbl_name))) {
+                    ok = false;
+                }
+                if (ok && consume_keyword(p, "USING")) {
+                    if (consume_keyword(p, "HNSW")) is_hnsw = true;
+                    else ok = false;
+                }
+                if (ok && (!consume_token(p, TK_LP) || !parse_identifier(p, col_name) || !consume_token(p, TK_RP))) {
+                    ok = false;
+                }
+                if (ok && !is_hnsw && consume_keyword(p, "USING")) {
+                    if (consume_keyword(p, "HNSW")) is_hnsw = true;
+                    else ok = false;
+                }
+                if (ok && is_hnsw && consume_keyword(p, "WITH")) {
+                    if (consume_token(p, TK_LP)) {
+                        if (consume_keyword(p, "METRIC") || consume_keyword(p, "DISTANCE")) {
+                            consume_token(p, TK_EQ);
+                            if (consume_keyword(p, "L2")) hnsw_metric = 1;
+                            else consume_keyword(p, "COSINE");
+                        }
+                        consume_token(p, TK_RP);
+                    }
+                }
+                if (ok && !consume_statement_end(p)) {
+                    ok = false;
+                } else if (ok) {
+                    bool already_exists = false;
+                    for (int i = 0; i < candidate->index_count; i++) {
+                        if (!strcmp(candidate->indexes[i].name, idx_name)) { already_exists = true; break; }
+                    }
+                    if (already_exists && if_not_exists) {
+                        ok = true;
+                    } else if (is_hnsw) {
+                        ok = execute_create_hnsw_index_in_db(candidate, idx_name, tbl_name, col_name, hnsw_metric);
+                    } else {
+                        ok = execute_create_index_in_db(candidate, idx_name, tbl_name, col_name, unique);
+                    }
+                }
             }
         } else {
             ok = execute_create_table(p, candidate);
@@ -191,11 +252,28 @@ bool execute_atomic_mutation(Parser* p, const char* command) {
         if (token_is_keyword(p, "INDEX")) {
             is_index_drop = true;
             consume_keyword(p, "INDEX");
+            ok = true;
+            bool if_exists = false;
+            if (consume_keyword(p, "IF")) {
+                if (!consume_keyword(p, "EXISTS")) ok = false;
+                else if_exists = true;
+            }
             char idx_name[MAX_NAME_LEN];
-            if (!parse_identifier(p, idx_name) || !consume_statement_end(p)) {
+            if (ok && (!parse_identifier(p, idx_name) || !consume_statement_end(p))) {
                 ok = false;
-            } else {
-                ok = execute_drop_index_in_db(candidate, idx_name);
+            } else if (ok) {
+                bool found = false;
+                for (int i = 0; i < candidate->index_count; i++) {
+                    if (!strcmp(candidate->indexes[i].name, idx_name)) { found = true; break; }
+                }
+                if (!found && if_exists) {
+                    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+                        ok = report_database_error("permission denied: DROP INDEX requires the ADMIN role");
+                    else
+                        ok = true;
+                } else {
+                    ok = execute_drop_index_in_db(candidate, idx_name);
+                }
             }
         } else {
             ok = execute_drop_table(p, candidate);
@@ -207,20 +285,30 @@ bool execute_atomic_mutation(Parser* p, const char* command) {
 
     if (ok) ok = validate_relational_integrity(candidate);
     if (!ok) {
-        destroy_database(candidate);
+        if (is_dml) {
+            undo_log_rollback_to(undo_savepoint, g_db);
+        } else {
+            destroy_database(candidate);
+        }
         if (g_errors == before_errors) report_database_error("invalid or unsupported %s syntax/value; statement unchanged", command);
         return false;
     }
-    destroy_database(g_db); g_db = candidate; g_pending = true;
-    if (is_index_create) puts("Index created.");
-    else if (is_index_drop) puts("Index dropped.");
-    else if (!strcmp(command, "CREATE")) puts("Table created.");
-    else if (!strcmp(command, "DROP")) puts("Table dropped.");
-    else if (!strcmp(command, "ALTER")) puts("Table altered.");
-    else if (!strcmp(command, "TRUNCATE")) puts("Table truncated.");
-    else if (!strcmp(command, "INSERT")) printf("%d row%s created.\n", affected, affected == 1 ? "" : "s");
-    else printf("%d row%s %s.\n", affected, affected == 1 ? "" : "s",
-                !strcmp(command, "DELETE") ? "deleted" : "updated");
+    if (!is_dml) {
+        destroy_database(g_db); g_db = candidate;
+        undo_log_clear();
+    }
+    g_pending = true;
+    if (!g_silent_mode) {
+        if (is_index_create) puts("Index created.");
+        else if (is_index_drop) puts("Index dropped.");
+        else if (!strcmp(command, "CREATE")) puts("Table created.");
+        else if (!strcmp(command, "DROP")) puts("Table dropped.");
+        else if (!strcmp(command, "ALTER")) puts("Table altered.");
+        else if (!strcmp(command, "TRUNCATE")) puts("Table truncated.");
+        else if (!strcmp(command, "INSERT")) printf("%d row%s created.\n", affected, affected == 1 ? "" : "s");
+        else printf("%d row%s %s.\n", affected, affected == 1 ? "" : "s",
+                    !strcmp(command, "DELETE") ? "deleted" : "updated");
+    }
     if (g_autocommit) return commit_transaction();
     return true;
 }

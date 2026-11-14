@@ -221,7 +221,7 @@ bool execute_create_index_in_db(Database* db, const char* idx_name, const char* 
 
     int t_idx = find_table_index(db, tbl_name);
     if (t_idx < 0) return report_database_error("table does not exist: %s", tbl_name);
-    if (g_network_user[0])
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
         return report_database_error("permission denied: CREATE INDEX requires the ADMIN role");
     const Table* table = &db->tables[t_idx];
 
@@ -262,6 +262,8 @@ bool execute_create_index_in_db(Database* db, const char* idx_name, const char* 
 bool execute_drop_index_in_db(Database* db, const char* idx_name) {
     if (!db) return report_database_error("database not open");
     if (!idx_name || !*idx_name) return report_database_error("invalid index name");
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: DROP INDEX requires the ADMIN role");
 
     int found = -1;
     for (int i = 0; i < db->index_count; i++) {
@@ -271,7 +273,11 @@ bool execute_drop_index_in_db(Database* db, const char* idx_name) {
     }
     if (found < 0) return report_database_error("index not found: %s", idx_name);
 
-    free(db->indexes[found].entries);
+    if (db->indexes[found].is_hnsw) {
+        hnsw_index_destroy(&db->indexes[found]);
+    } else {
+        free(db->indexes[found].entries);
+    }
     for (int i = found; i < db->index_count - 1; i++) {
         db->indexes[i] = db->indexes[i + 1];
     }
@@ -311,7 +317,11 @@ void rebuild_secondary_indexes(Database* db) {
         int t = find_table_index(db, db->indexes[i].table_name);
         if (t >= 0) {
             db->indexes[i].table_idx = t;
-            build_secondary_index(&db->indexes[i], &db->tables[t], db->indexes[i].col_idx);
+            if (db->indexes[i].is_hnsw) {
+                hnsw_index_build(&db->indexes[i], &db->tables[t], db->indexes[i].col_idx);
+            } else {
+                build_secondary_index(&db->indexes[i], &db->tables[t], db->indexes[i].col_idx);
+            }
         }
     }
 }
@@ -322,6 +332,10 @@ void secondary_index_insert_row(Database* db, int table_idx, int row_idx) {
     for (int i = 0; i < db->index_count; i++) {
         SecondaryIndex* idx = &db->indexes[i];
         if (!strcmp(idx->table_name, table->name)) {
+            if (idx->is_hnsw) {
+                hnsw_index_insert_row(idx, table, row_idx);
+                continue;
+            }
             if (idx->col_idx < 0 || idx->col_idx >= table->col_count) continue;
             const Value* v = &table->rows[row_idx].values[idx->col_idx];
             if (!v->is_null) {
@@ -350,6 +364,11 @@ void secondary_index_remove_row(Database* db, int table_idx, int row_idx) {
     for (int i = 0; i < db->index_count; i++) {
         SecondaryIndex* idx = &db->indexes[i];
         if (!strcmp(idx->table_name, table->name)) {
+            if (idx->is_hnsw) {
+                hnsw_index_build(idx, table, idx->col_idx);
+                continue;
+            }
+            if (!idx->entries) continue;
             int write_k = 0;
             for (int k = 0; k < idx->entry_count; k++) {
                 if (idx->entries[k].row_index == row_idx) continue;
@@ -401,6 +420,8 @@ int secondary_index_find_range(const SecondaryIndex* idx, DataType type, const V
 bool execute_analyze_table(const char* table_name) {
     if (!g_db) return report_database_error("no open database");
     if (g_readonly) return report_database_error("cannot ANALYZE in read-only mode");
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: ANALYZE requires the ADMIN role");
     if (g_raft_role == RAFT_FOLLOWER) return report_database_error("follower nodes accept read-only queries");
     int t_idx = find_table_index(g_db, table_name);
     if (t_idx < 0) return report_database_error("table does not exist: %s", table_name);
@@ -598,25 +619,25 @@ double cbo_estimate_predicate_selectivity(const Table* tbl, const Predicate* pre
     return 0.33;
 }
 
-static double cbo_eval_filter_node(const Table* tbl, int table_scope_idx, const Filter* filter, int node_idx) {
-    if (!filter || node_idx < 0 || node_idx >= filter->node_count) return 1.0;
+static double cbo_eval_filter_node_depth(const Table* tbl, int table_scope_idx, const Filter* filter, int node_idx, int depth) {
+    if (!filter || node_idx < 0 || node_idx >= filter->node_count || depth > 128) return 1.0;
     const FilterNode* fn = &filter->nodes[node_idx];
     if (fn->type == FILTER_NODE_PRED) {
         if (fn->pred.left.table != table_scope_idx) return 1.0;
         return cbo_estimate_predicate_selectivity(tbl, &fn->pred);
     }
     if (fn->type == FILTER_NODE_AND) {
-        double sl = cbo_eval_filter_node(tbl, table_scope_idx, filter, fn->left_child);
-        double sr = cbo_eval_filter_node(tbl, table_scope_idx, filter, fn->right_child);
+        double sl = cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, fn->left_child, depth + 1);
+        double sr = cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, fn->right_child, depth + 1);
         return sl * sr;
     }
     if (fn->type == FILTER_NODE_OR) {
-        double sl = cbo_eval_filter_node(tbl, table_scope_idx, filter, fn->left_child);
-        double sr = cbo_eval_filter_node(tbl, table_scope_idx, filter, fn->right_child);
+        double sl = cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, fn->left_child, depth + 1);
+        double sr = cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, fn->right_child, depth + 1);
         return sl + sr - (sl * sr);
     }
     if (fn->type == FILTER_NODE_NOT) {
-        double sl = cbo_eval_filter_node(tbl, table_scope_idx, filter, fn->left_child);
+        double sl = cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, fn->left_child, depth + 1);
         return 1.0 - sl;
     }
     return 1.0;
@@ -624,7 +645,7 @@ static double cbo_eval_filter_node(const Table* tbl, int table_scope_idx, const 
 
 double cbo_estimate_filter_selectivity(const Table* tbl, int table_scope_idx, const Filter* filter) {
     if (!tbl || !filter || filter->node_count <= 0 || filter->root < 0) return 1.0;
-    return cbo_eval_filter_node(tbl, table_scope_idx, filter, filter->root);
+    return cbo_eval_filter_node_depth(tbl, table_scope_idx, filter, filter->root, 0);
 }
 
 double cbo_estimate_query_cost(const Database* db, const Table* tbl, int table_scope_idx, const Filter* filter, bool* out_use_index, int* out_index_id, int* out_est_rows) {
@@ -753,20 +774,20 @@ static uint32_t prune_partitions_for_pred(const Table* tbl, int table_scope_idx,
     return all_mask;
 }
 
-static uint32_t prune_partitions_node(const Table* tbl, int table_scope_idx, const Filter* filter, int node_idx) {
+static uint32_t prune_partitions_node(const Table* tbl, int table_scope_idx, const Filter* filter, int node_idx, int depth) {
     uint32_t all_mask = (tbl->part_count >= 32) ? 0xFFFFFFFFu : ((1u << (unsigned)tbl->part_count) - 1u);
-    if (!filter || node_idx < 0 || node_idx >= filter->node_count) return all_mask;
+    if (!filter || node_idx < 0 || node_idx >= filter->node_count || depth > 128) return all_mask;
     const FilterNode* fn = &filter->nodes[node_idx];
     if (fn->type == FILTER_NODE_PRED) {
         return prune_partitions_for_pred(tbl, table_scope_idx, &fn->pred);
     }
     if (fn->type == FILTER_NODE_AND) {
-        return prune_partitions_node(tbl, table_scope_idx, filter, fn->left_child) &
-               prune_partitions_node(tbl, table_scope_idx, filter, fn->right_child);
+        return prune_partitions_node(tbl, table_scope_idx, filter, fn->left_child, depth + 1) &
+               prune_partitions_node(tbl, table_scope_idx, filter, fn->right_child, depth + 1);
     }
     if (fn->type == FILTER_NODE_OR) {
-        return prune_partitions_node(tbl, table_scope_idx, filter, fn->left_child) |
-               prune_partitions_node(tbl, table_scope_idx, filter, fn->right_child);
+        return prune_partitions_node(tbl, table_scope_idx, filter, fn->left_child, depth + 1) |
+               prune_partitions_node(tbl, table_scope_idx, filter, fn->right_child, depth + 1);
     }
     return all_mask;
 }
@@ -775,7 +796,7 @@ uint32_t prune_partitions_for_filter(const Table* tbl, int table_scope_idx, cons
     if (!tbl || tbl->part_type == PART_NONE || tbl->part_count <= 0) return 0xFFFFFFFFu;
     uint32_t all_mask = (tbl->part_count >= 32) ? 0xFFFFFFFFu : ((1u << (unsigned)tbl->part_count) - 1u);
     if (!filter || filter->node_count <= 0 || filter->root < 0) return all_mask;
-    return prune_partitions_node(tbl, table_scope_idx, filter, filter->root);
+    return prune_partitions_node(tbl, table_scope_idx, filter, filter->root, 0);
 }
 
 void vector_aggregate_numeric_partitioned(const Table* table, int col_idx, const Filter* filter, uint32_t active_part_mask, long double* out_sum, long double* out_min, long double* out_max, int* out_count) {

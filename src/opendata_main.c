@@ -1,5 +1,174 @@
 #include "database_engine.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <winsvc.h>
+#pragma comment(lib, "advapi32.lib")
+
+static SERVICE_STATUS g_service_status;
+static SERVICE_STATUS_HANDLE g_status_handle = NULL;
+static const char* g_svc_database = NULL;
+static int g_svc_port = 7350;
+
+static void WINAPI ServiceCtrlHandler(DWORD request) {
+    switch (request) {
+    case SERVICE_CONTROL_STOP:
+    case SERVICE_CONTROL_SHUTDOWN:
+        g_service_status.dwWin32ExitCode = 0;
+        g_service_status.dwCurrentState = SERVICE_STOPPED;
+        SetServiceStatus(g_status_handle, &g_service_status);
+        exit(0);
+        break;
+    default:
+        break;
+    }
+    SetServiceStatus(g_status_handle, &g_service_status);
+}
+
+static void WINAPI ServiceMain(DWORD dwArgc, LPSTR* lpszArgv) {
+    (void)dwArgc;
+    (void)lpszArgv;
+    g_status_handle = RegisterServiceCtrlHandlerA("OpenDataSQL", ServiceCtrlHandler);
+    if (!g_status_handle) return;
+
+    memset(&g_service_status, 0, sizeof(g_service_status));
+    g_service_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_service_status.dwCurrentState = SERVICE_START_PENDING;
+    SetServiceStatus(g_status_handle, &g_service_status);
+
+    const char* db_file = g_svc_database ? g_svc_database : "opendata.pcod";
+    resolve_absolute_path(db_file, g_path);
+    initialize_snapshot_io();
+    if (!open_or_restore_database(NULL)) {
+        g_service_status.dwCurrentState = SERVICE_STOPPED;
+        g_service_status.dwWin32ExitCode = ERROR_FILE_NOT_FOUND;
+        SetServiceStatus(g_status_handle, &g_service_status);
+        return;
+    }
+
+    g_service_status.dwCurrentState = SERVICE_RUNNING;
+    g_service_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    SetServiceStatus(g_status_handle, &g_service_status);
+
+    ServerConfig cfg = { g_svc_port ? g_svc_port : 7350, "0.0.0.0", false, NULL, NULL };
+    g_server_mode = true;
+    install_server_signal_handlers();
+    run_headless_server(&cfg);
+
+    g_service_status.dwCurrentState = SERVICE_STOPPED;
+    SetServiceStatus(g_status_handle, &g_service_status);
+}
+
+bool install_windows_service(const char* service_name, const char* display_name, const char* db_path, int port) {
+    char exe_path[MAX_PATH];
+    if (GetModuleFileNameA(NULL, exe_path, MAX_PATH) == 0) return false;
+
+    const char* target_db = (db_path && *db_path) ? db_path : "opendata.pcod";
+    const char* sname = (service_name && *service_name) ? service_name : "OpenDataSQL";
+    const char* dname = (display_name && *display_name) ? display_name : "PC/OpenData SQL Database Server";
+    if (strpbrk(target_db, "\"\r\n") || strpbrk(sname, "\"\r\n") || strpbrk(dname, "\"\r\n")) {
+        printf("ERROR: Service parameters cannot contain quotes or newline characters.\n");
+        return false;
+    }
+
+    char cmd[MAX_PATH * 2 + 128];
+    int n = snprintf(cmd, sizeof(cmd), "\"%s\" --service-worker --database \"%s\" --port %d",
+                     exe_path, target_db, (port > 0 && port <= 65535) ? port : 7350);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) return false;
+
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) {
+        printf("Failed to open Service Control Manager (run as Administrator).\n");
+        return false;
+    }
+
+    SC_HANDLE svc = CreateServiceA(
+        scm, sname, dname,
+        SERVICE_ALL_ACCESS,
+        SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_AUTO_START,
+        SERVICE_ERROR_NORMAL,
+        cmd, NULL, NULL, NULL, NULL, NULL);
+
+    if (!svc) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SERVICE_EXISTS) {
+            printf("Service '%s' already exists.\n", sname);
+        } else {
+            printf("CreateService failed (error %lu).\n", err);
+        }
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    printf("Service '%s' successfully installed.\n", sname);
+    printf("Binary path: %s\n", cmd);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return true;
+}
+
+bool uninstall_windows_service(const char* service_name) {
+    const char* sname = (service_name && *service_name) ? service_name : "OpenDataSQL";
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) {
+        printf("Failed to open Service Control Manager (run as Administrator).\n");
+        return false;
+    }
+
+    SC_HANDLE svc = OpenServiceA(scm, sname, SERVICE_STOP | DELETE);
+    if (!svc) {
+        printf("Service '%s' not found or cannot be opened.\n", sname);
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS status;
+    ControlService(svc, SERVICE_CONTROL_STOP, &status);
+
+    if (!DeleteService(svc)) {
+        printf("Failed to delete service '%s' (error %lu).\n", sname, GetLastError());
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    printf("Service '%s' successfully uninstalled.\n", sname);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return true;
+}
+
+bool start_windows_service(const char* service_name) {
+    const char* sname = (service_name && *service_name) ? service_name : "OpenDataSQL";
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) return false;
+    SC_HANDLE svc = OpenServiceA(scm, sname, SERVICE_START);
+    if (!svc) { CloseServiceHandle(scm); return false; }
+    bool ok = StartServiceA(svc, 0, NULL) != 0;
+    if (ok) printf("Service '%s' started.\n", sname);
+    else printf("Failed to start service '%s' (error %lu).\n", sname, GetLastError());
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok;
+}
+
+bool stop_windows_service(const char* service_name) {
+    const char* sname = (service_name && *service_name) ? service_name : "OpenDataSQL";
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (!scm) return false;
+    SC_HANDLE svc = OpenServiceA(scm, sname, SERVICE_STOP);
+    if (!svc) { CloseServiceHandle(scm); return false; }
+    SERVICE_STATUS status;
+    bool ok = ControlService(svc, SERVICE_CONTROL_STOP, &status) != 0;
+    if (ok) printf("Service '%s' stopped.\n", sname);
+    else printf("Failed to stop service '%s' (error %lu).\n", sname, GetLastError());
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok;
+}
+#endif
+
 static bool parse_cli_number(const char* text, int minimum, int maximum, int* value) {
     char* end;
     errno = 0;
@@ -94,7 +263,8 @@ static bool is_statement_complete(const char* str) {
         !strcmp(word, "BROWSE") || !strcmp(word, "SUPPORT") ||
         !strcmp(word, "CONNECTION") || !strcmp(word, "LOAD") ||
         !strcmp(word, "GRANT") || !strcmp(word, "REVOKE") || !strcmp(word, "VERIFY") ||
-        !strcmp(word, "GUIDE") ||
+        !strcmp(word, "GUIDE") || !strcmp(word, "SELFTEST") || !strcmp(word, "SELF_TEST") ||
+        !strcmp(word, "SELF") ||
         *str == '?' || *str == '.' || *str == '@') {
         return true;
     }
@@ -118,6 +288,8 @@ int main(int argc, char** argv) {
     const char* database = NULL; const char* backup = NULL; const char* restore = NULL;
     bool is_server = false, is_tcps = false, is_subsystem = false, do_ping = false;
     bool no_default_db = false;
+    bool is_dev = false;
+    uint32_t pitr_ts = 0;
     int server_port = 0;
     const char* bind_ip = "127.0.0.1";
     const char* execute_sql = NULL;
@@ -137,10 +309,26 @@ int main(int argc, char** argv) {
     char cluster_peers[4][64];
     int peer_count = 0;
     bool cluster_enabled = false;
+    const char* ad_server = NULL;
+    const char* ad_domain = NULL;
+    const char* ad_admin_group = NULL;
+    const char* ldap_server = NULL;
+    int ldap_port = 0;
+    bool ldap_ssl = false;
+    const char* ldap_base_dn = NULL;
+    const char* ldap_admin_group = NULL;
+    const char* krb_realm = NULL;
+    const char* krb_service = NULL;
+    const char* krb_keytab = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { print_command_help(); puts("\nGet started: opendata mydata.pcod"); return 0; }
         if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-v")) { puts("PC/OpenData " SERVER_VERSION); puts("Get started: opendata mydata.pcod"); return 0; }
+        if (!strcmp(argv[i], "self-test") || !strcmp(argv[i], "selftest") ||
+            !strcmp(argv[i], "--self-test") || !strcmp(argv[i], "--selftest")) {
+            const char* filter = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[i + 1] : NULL;
+            return execute_self_test(filter) ? 0 : 1;
+        }
         if (!strcmp(argv[i], "--inspect-wallet")) {
             if (i + 1 >= argc) { report_database_error("--inspect-wallet requires a wallet directory"); return 1; }
             inspect_wallet_path = argv[++i];
@@ -155,6 +343,63 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--check-config")) {
             if (argc != 2) { report_database_error("--check-config cannot be combined with other options"); return 1; }
             return validate_user_config() ? 0 : 1;
+        }
+#ifdef _WIN32
+        if (!strcmp(argv[i], "--install-service")) {
+            const char* sname = "OpenDataSQL";
+            if (i + 1 < argc && argv[i + 1][0] != '-') sname = argv[++i];
+            return install_windows_service(sname, "PC/OpenData SQL Database Server", database ? database : "opendata.pcod", server_port ? server_port : 7350) ? 0 : 1;
+        }
+        if (!strcmp(argv[i], "--uninstall-service")) {
+            const char* sname = "OpenDataSQL";
+            if (i + 1 < argc && argv[i + 1][0] != '-') sname = argv[++i];
+            return uninstall_windows_service(sname) ? 0 : 1;
+        }
+        if (!strcmp(argv[i], "--start-service")) {
+            const char* sname = "OpenDataSQL";
+            if (i + 1 < argc && argv[i + 1][0] != '-') sname = argv[++i];
+            return start_windows_service(sname) ? 0 : 1;
+        }
+        if (!strcmp(argv[i], "--stop-service")) {
+            const char* sname = "OpenDataSQL";
+            if (i + 1 < argc && argv[i + 1][0] != '-') sname = argv[++i];
+            return stop_windows_service(sname) ? 0 : 1;
+        }
+        if (!strcmp(argv[i], "--service-worker")) {
+            if (database) g_svc_database = database;
+            if (server_port) g_svc_port = server_port;
+            SERVICE_TABLE_ENTRYA DispatchTable[] = {
+                { (LPSTR)"OpenDataSQL", (LPSERVICE_MAIN_FUNCTIONA)ServiceMain },
+                { NULL, NULL }
+            };
+            StartServiceCtrlDispatcherA(DispatchTable);
+            return 0;
+        }
+#endif
+        if (!strcmp(argv[i], "--pitr")) {
+            if (i + 1 >= argc) { report_database_error("--pitr requires a timestamp value"); return 1; }
+            pitr_ts = (uint32_t)strtoul(argv[++i], NULL, 10);
+            continue;
+        }
+                if (!strcmp(argv[i], "--dev")) {
+            is_server = true;
+            server_port = 7350;
+            bind_ip = "127.0.0.1";
+            if (!database) database = "dev.pcod";
+            is_dev = true;
+            continue;
+        }
+        if (argv[i][0] != '-') {
+            if (!database) {
+                database = argv[i];
+                continue;
+            } else if (!execute_sql) {
+                execute_sql = argv[i];
+                continue;
+            } else {
+                report_database_error("unexpected argument: %s", argv[i]);
+                return 1;
+            }
         }
         if (!strcmp(argv[i], "--sync-replication")) { sync_replication = true; cluster_enabled = true; continue; }
         if (!strcmp(argv[i], "--cluster-follower")) { is_follower = true; cluster_enabled = true; continue; }
@@ -216,7 +461,33 @@ int main(int argc, char** argv) {
             char* end; errno = 0; unsigned long seconds = strtoul(argv[++i], &end, 10);
             if (errno || !argv[i][0] || *end || seconds < 1 || seconds > 86400) { report_database_error("invalid backup interval"); return 1; }
             g_backup_interval = (unsigned)seconds;
-        } else { report_database_error("unknown option: %s", argv[i]); return 1; }
+        }
+        else if (!strcmp(argv[i], "--ad-server")) ad_server = argv[++i];
+        else if (!strcmp(argv[i], "--ad-domain")) ad_domain = argv[++i];
+        else if (!strcmp(argv[i], "--ad-admin-group")) ad_admin_group = argv[++i];
+        else if (!strcmp(argv[i], "--ldap-server")) ldap_server = argv[++i];
+        else if (!strcmp(argv[i], "--ldap-port")) {
+            if (!parse_cli_number(argv[++i], 1, 65535, &ldap_port)) return 1;
+        }
+        else if (!strcmp(argv[i], "--ldap-ssl")) { ldap_ssl = true; continue; }
+        else if (!strcmp(argv[i], "--ldap-base-dn")) ldap_base_dn = argv[++i];
+        else if (!strcmp(argv[i], "--ldap-admin-group")) ldap_admin_group = argv[++i];
+        else if (!strcmp(argv[i], "--statement-timeout")) {
+            int to_ms = 0;
+            if (!parse_cli_number(argv[++i], 0, 86400000, &to_ms)) return 1;
+            g_statement_timeout_ms = (uint32_t)to_ms;
+        }
+        else if (!strcmp(argv[i], "--auto-vacuum")) { g_autovacuum_enabled = true; continue; }
+        else if (!strcmp(argv[i], "--no-auto-vacuum")) { g_autovacuum_enabled = false; continue; }
+        else if (!strcmp(argv[i], "--krb-realm")) krb_realm = argv[++i];
+        else if (!strcmp(argv[i], "--krb-service")) krb_service = argv[++i];
+        else if (!strcmp(argv[i], "--krb-keytab")) krb_keytab = argv[++i];
+        else if (!strcmp(argv[i], "--buffer-pool-size") || !strcmp(argv[i], "--buffer-pool") || !strcmp(argv[i], "-B")) {
+            int pool_mb = 0;
+            if (!parse_cli_number(argv[++i], 1, 1048576, &pool_mb)) return 1;
+            g_buffer_pool_size_mb = (uint32_t)pool_mb;
+        }
+        else { report_database_error("unknown option: %s", argv[i]); return 1; }
     }
     if (inspect_wallet_path) {
         if (argc != 3 || strcmp(argv[1], "--inspect-wallet")) {
@@ -265,6 +536,15 @@ int main(int argc, char** argv) {
         report_database_error("cluster nodes must run in --server mode");
         return 1;
     }
+    if (ad_server && ad_domain) {
+        configure_directory_ad(ad_server, ad_domain, ad_admin_group);
+    }
+    if (ldap_server && ldap_base_dn) {
+        configure_directory_ldap(ldap_server, (int)ldap_port, ldap_ssl, ldap_base_dn, "uid", ldap_admin_group);
+    }
+    if (krb_realm) {
+        configure_kerberos(krb_service ? krb_service : "opendata", krb_realm, krb_keytab);
+    }
     /* Zero-arg interactive launch: open the configured default database,
        creating it if missing. --no-default-db opts out. */
     if (!database && !is_server && !execute_sql && !do_ping && !no_default_db &&
@@ -288,6 +568,10 @@ int main(int argc, char** argv) {
         }
         initialize_snapshot_io();
         ready = open_or_restore_database(restore);
+        if (ready && pitr_ts > 0) {
+            printf("Performing Point-In-Time Recovery (PITR) to timestamp %u...\n", pitr_ts);
+            wal_pitr_restore(g_path, g_backup_dir[0] ? g_backup_dir : NULL, pitr_ts);
+        }
         /* Bootstrap is a local provisioning commit, before follower/quorum enforcement. */
         if (ready && cluster_enabled && !is_follower && !bootstrap_server_accounts()) ready = false;
         if (ready && !g_readonly && g_backup_dir[0] != '\0' && g_backup_interval > 0) {
@@ -341,7 +625,9 @@ int main(int argc, char** argv) {
             report_database_error("--database is required for server mode"); return 1;
         }
         if (execute_sql) {
-            report_database_error("--database is required with --execute"); return 1;
+            initialize_snapshot_io();
+            g_committed = calloc(1, sizeof(*g_committed));
+            if (g_committed) g_db = copy_database(g_committed);
         }
         ready = true;
     }
@@ -357,6 +643,19 @@ int main(int argc, char** argv) {
                 cluster_enabled && !is_tcps ? NULL : key_path };
             g_server_mode = true;
             g_cluster_active = cluster_enabled;
+                        if (is_dev) {
+                if (g_committed && g_committed->user_count == 0) {
+                    execute_console_statement("CREATE USER 'dev' IDENTIFIED BY 'devpassword12345' ROLE ADMIN;", &ready);
+                }
+                printf("================================================================================\n");
+                printf("                    OpenData Development Server (--dev)\n");
+                printf("  Listening on: %s:%d\n", bind_ip, server_port);
+                printf("  Database:     %s\n", database ? database : "(memory)");
+                printf("  User:         dev\n");
+                printf("  Password:     devpassword12345\n");
+                printf("  Connect:      opendata --port %d -u dev (or connect via VS Code / Studio)\n", server_port);
+                printf("================================================================================\n");
+            }
             install_server_signal_handlers();
             if (!run_headless_server(&cfg)) ready = false;
         } else {
@@ -403,70 +702,94 @@ int main(int argc, char** argv) {
                         "WARNING: verify --backup-dir is off-machine. Recovery window extends to the last completed backup.\n",
                         SERVER_VERSION, g_backup_interval);
             }
+            load_history_file();
             char* buf = malloc(MAX_QUERY_LEN);
-            if (!buf) report_database_error("cannot allocate input buffer");
-            else {
+            char* line_in = malloc(MAX_QUERY_LEN);
+            char* expanded = malloc(MAX_QUERY_LEN);
+            if (!buf || !line_in || !expanded) {
+                report_database_error("cannot allocate input buffer");
+                free(buf);
+                free(line_in);
+                free(expanded);
+            } else {
                 bool quit = false;
                 size_t buf_used = 0;
                 while (!quit) {
+                    char prompt[128];
                     if (is_term) {
                         if (buf_used == 0) {
-                            fputs("OpenData SQL> ", stdout);
+                            if (g_path[0]) {
+                                const char* base = g_path;
+                                for (const char* p = g_path; *p; p++) {
+                                    if (*p == '/' || *p == '\\') base = p + 1;
+                                }
+                                snprintf(prompt, sizeof(prompt), "opendata (%s%s)> ",
+                                         base, g_readonly ? " RO" : (g_pending ? " *" : ""));
+                            } else {
+                                snprintf(prompt, sizeof(prompt), "opendata> ");
+                            }
                         } else {
-                            fputs("              -> ", stdout);
+                            snprintf(prompt, sizeof(prompt), "   ...> ");
                         }
-                        fflush(stdout);
+                    } else {
+                        prompt[0] = '\0';
                     }
-                    bool too_long = false, nul = false;
-                    int ch;
-                    if (buf_used > 0 && buf_used + 1 < MAX_QUERY_LEN) {
-                        buf[buf_used++] = ' ';
+
+                    if (!read_interactive_line(prompt, line_in, MAX_QUERY_LEN)) {
+                        break;
                     }
-                    size_t line_start = buf_used;
-                    while ((ch = getchar()) != '\n' && ch != EOF) {
-                        if (ch == 0) nul = true;
-                        if (buf_used + 1 < MAX_QUERY_LEN) buf[buf_used++] = (char)ch;
-                        else too_long = true;
-                    }
-                    if (ch == EOF && buf_used == line_start && buf_used == 0) break;
-                    buf[buf_used] = '\0';
-                    const char* line_ptr = buf + line_start;
+                    history_expand(line_in, expanded, MAX_QUERY_LEN);
+
+                    const char* line_ptr = expanded;
                     while (is_sql_whitespace(*line_ptr)) line_ptr++;
+                    if (!*line_ptr && buf_used == 0) continue;
+                    if (!*line_ptr && buf_used > 0) {
+                        execute_console_statement(buf, &quit);
+                        buf_used = 0;
+                        buf[0] = '\0';
+                        continue;
+                    }
+
                     char line_cmd[16] = {0};
                     size_t cmd_i = 0;
                     while (*line_ptr && !is_sql_whitespace(*line_ptr) && *line_ptr != ';' && cmd_i + 1 < sizeof(line_cmd)) {
                         line_cmd[cmd_i++] = uppercase_ascii(*line_ptr++);
                     }
                     line_cmd[cmd_i] = '\0';
-                    if (!strcmp(line_cmd, "\\C") || !strcmp(line_cmd, "\\Q") || !strcmp(line_cmd, "CANCEL")) {
+                    if (!strcmp(line_cmd, "\\C") || !strcmp(line_cmd, "CANCEL")) {
                         buf_used = 0;
                         buf[0] = '\0';
                         puts("Query buffer cleared.");
                         continue;
                     }
-                    if (too_long || nul) {
-                        report_database_error(too_long ? "statement exceeds input limit" : "NUL bytes are not valid SQL input");
+
+                    size_t elen = strlen(expanded);
+                    if (buf_used + elen + 2 >= MAX_QUERY_LEN) {
+                        report_database_error("statement exceeds input limit");
                         buf_used = 0;
+                        buf[0] = '\0';
                         continue;
                     }
-                    if (buf_used == line_start) {
-                        // Empty line entered
-                        if (line_start > 0) buf[--buf_used] = '\0';
-                    }
-                    if (ch == EOF || is_statement_complete(buf)) {
-                        if (buf_used > 0) {
-                            execute_console_statement(buf, &quit);
-                            buf_used = 0;
-                            if (fflush(stdout) == EOF) { report_database_error("output write failed"); break; }
-                        }
-                        if (ch == EOF) break;
+
+                    if (buf_used > 0) buf[buf_used++] = ' ';
+                    memcpy(buf + buf_used, expanded, elen);
+                    buf_used += elen;
+                    buf[buf_used] = '\0';
+
+                    if (is_statement_complete(buf)) {
+                        execute_console_statement(buf, &quit);
+                        buf_used = 0;
+                        buf[0] = '\0';
+                        if (fflush(stdout) == EOF) { report_database_error("output write failed"); break; }
                     }
                 }
+                save_history_file();
                 if (is_term && quit) {
                     puts("Bye!");
                 }
-                if (ferror(stdin)) report_database_error("input read failed");
                 free(buf);
+                free(line_in);
+                free(expanded);
             }
             g_interactive_shell = false;
         }
@@ -486,7 +809,9 @@ int main(int argc, char** argv) {
         fclose(g_spool_file);
         g_spool_file = NULL;
     }
-    if (g_pending) fprintf(stderr, "NOTICE: uncommitted transaction discarded at exit.\n");
+    if (g_pending && !g_silent_mode) fprintf(stderr, "NOTICE: uncommitted transaction discarded at exit.\n");
+    clear_all_savepoints();
+    undo_log_clear();
     destroy_database(g_db); destroy_database(g_committed);
     release_database_file_lock();
     shutdown_snapshot_io();

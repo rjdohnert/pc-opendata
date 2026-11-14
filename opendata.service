@@ -1,0 +1,20 @@
+[Unit]
+Description=PC/OpenData Headless SQL Database Server
+After=network.target
+
+[Service]
+Type=simple
+User=opendata
+Group=opendata
+EnvironmentFile=/etc/opendata/server.env
+ExecStart=/usr/local/bin/opendata --database /var/lib/opendata/production.pcod --backup-dir /var/backups/opendata --backup-interval 60 --tcps --port 7338 --cert /etc/opendata/server.pem --key /etc/opendata/server-key.pem
+# Zero-downtime hot patch: send SIGUSR2 directly (kill -USR2 <mainpid>). Do NOT
+# use systemctl reload: with Type=simple the unit stops when the predecessor
+# exits after the handoff, and the default KillMode=control-group would SIGTERM
+# the successor. A future socket-activation unit would make reload safe.
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

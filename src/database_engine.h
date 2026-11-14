@@ -68,8 +68,20 @@
 #endif
 
 #define SERVER_VERSION "27.0 SQL Server"
-#define MAX_TABLES 128
-#define MAX_COLUMNS 32
+#if defined(__cplusplus)
+#define THREAD_LOCAL thread_local
+#elif defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+#define THREAD_LOCAL __thread
+#else
+#define THREAD_LOCAL
+#endif
+
+#define MAX_TABLES 256
+#define MAX_COLUMNS 64
 #define MAX_ROWS 65536
 #define MAX_TOTAL_ROWS 1048576
 #define MAX_NAME_LEN 64
@@ -87,6 +99,7 @@
 
 typedef enum { TYPE_NUMBER, TYPE_VARCHAR2, TYPE_DATE, TYPE_VECTOR } DataType;
 typedef struct { char text[MAX_VAL_LEN]; bool is_null; } Value;
+typedef struct { float scale; int8_t q[64]; int dim; } VectorSQ8;
 
 typedef enum {
    FK_ACTION_RESTRICT = 0,
@@ -103,10 +116,13 @@ typedef struct {
    ForeignKeyAction fk_on_delete;
    ForeignKeyAction fk_on_update;
    char constraint_name[MAX_NAME_LEN];
+   bool has_default;
+   char default_value[MAX_VAL_LEN];
+   bool auto_increment;
 } ColumnDef;
 typedef struct { Value values[MAX_COLUMNS]; } Row;
 
-#define CBO_HISTOGRAM_BUCKETS 8
+#define CBO_HISTOGRAM_BUCKETS 32
 
 typedef struct {
    int null_count;
@@ -191,6 +207,9 @@ typedef struct {
    int entry_count;
    int capacity;
    IndexEntry* entries;
+   bool is_hnsw;
+   int metric; /* 0: cosine (<=>), 1: L2 (<->) */
+   void* hnsw_graph;
 } SecondaryIndex;
 
 typedef enum { USER_ROLE_ADMIN = 1, USER_ROLE_READ_ONLY = 2 } UserRole;
@@ -228,10 +247,107 @@ typedef struct {
    TableGrant grants[MAX_GRANTS];
 } Database;
 
+/* Phase 1: High-Concurrency Multi-User OLTP Concurrency Model */
+#define MAX_CLIENT_SESSIONS 256
+
+typedef enum {
+   LOCK_MODE_NONE = 0,
+   LOCK_MODE_SHARED = 1,
+   LOCK_MODE_EXCLUSIVE = 2
+} LockMode;
+
+typedef struct {
+   char table_name[MAX_NAME_LEN];
+   uint32_t row_id; /* 0 = table-level lock, > 0 = specific row */
+   LockMode mode;
+   int session_id;
+   uint64_t acquired_at_ms;
+} TableLockEntry;
+
+#define MAX_TABLE_LOCKS 512
+
+typedef struct {
+   TableLockEntry locks[MAX_TABLE_LOCKS];
+   int lock_count;
+   int wait_for[MAX_CLIENT_SESSIONS + 1];
+} LockManager;
+
+extern LockManager g_lock_manager;
+extern THREAD_LOCAL int g_current_session_id;
+
+void lock_manager_init(void);
+bool lock_manager_acquire(int session_id, const char* table_name, LockMode mode, uint32_t timeout_ms);
+bool lock_manager_acquire_row(int session_id, const char* table_name, uint32_t row_id, LockMode mode, uint32_t timeout_ms);
+void lock_manager_release_session(int session_id);
+void lock_manager_release_table(int session_id, const char* table_name);
+void lock_manager_release_row(int session_id, const char* table_name, uint32_t row_id);
+int lock_manager_get_holder(const char* table_name, LockMode mode);
+bool lock_manager_has_conflict(int session_id, const char* table_name, LockMode mode);
+bool lock_manager_has_row_conflict(int session_id, const char* table_name, uint32_t row_id, LockMode mode);
+bool lock_manager_detect_deadlock(int session_id, int target_session_id);
+
+typedef enum {
+   TX_STATE_IDLE = 0,
+   TX_STATE_ACTIVE = 1,
+   TX_STATE_ABORTED = 2
+} TxState;
+
+typedef struct {
+   int session_id;
+   TxState state;
+   uint64_t start_time_ms;
+   bool has_pending_writes;
+   char locked_tables[MAX_TABLES][MAX_NAME_LEN];
+   int locked_table_count;
+} TransactionContext;
+
+/* Fine-Grained In-Memory Undo Log */
+typedef enum {
+    UNDO_OP_INSERT,
+    UNDO_OP_UPDATE,
+    UNDO_OP_DELETE
+} UndoOp;
+
+typedef struct UndoEntry {
+    UndoOp op;
+    int table_idx;
+    int row_idx;
+    Row old_row;
+    struct UndoEntry* prev;
+} UndoEntry;
+
+typedef struct {
+    UndoEntry* head;
+    int entry_count;
+    size_t memory_bytes;
+} UndoLog;
+
+extern UndoLog g_undo_log;
+
+void undo_log_init(void);
+void undo_log_clear(void);
+bool undo_log_push_insert(int table_idx, int row_idx);
+bool undo_log_push_update(int table_idx, int row_idx, const Row* old_row);
+bool undo_log_push_delete(int table_idx, int row_idx, const Row* old_row);
+void undo_log_rollback_to(UndoEntry* savepoint, Database* db);
+void undo_log_rollback_all(Database* db);
+
+/* Thread Pool for High-Concurrency Multi-User OLTP (Phase 2) */
+typedef struct ThreadPool ThreadPool;
+typedef void (*ThreadPoolTaskFn)(void* arg);
+
+ThreadPool* thread_pool_create(int num_workers, int queue_capacity);
+bool thread_pool_submit(ThreadPool* pool, ThreadPoolTaskFn fn, void* arg);
+void thread_pool_destroy(ThreadPool* pool);
+int thread_pool_worker_count(const ThreadPool* pool);
+int thread_pool_queue_depth(const ThreadPool* pool);
+
+
+
 typedef enum { TK_END, TK_ID, TK_STRING, TK_NUMBER, TK_LP, TK_RP, TK_COMMA,
    TK_STAR, TK_DOT, TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE, TK_SEMI, TK_HELP,
-   TK_PLUS, TK_MINUS, TK_SLASH, TK_COSINE_DIST, TK_L2_DIST, TK_BAD } TokenKind;
-typedef struct { const char* cursor; TokenKind kind; char text[MAX_VAL_LEN]; bool failed; } Parser;
+   TK_PLUS, TK_MINUS, TK_SLASH, TK_COSINE_DIST, TK_L2_DIST, TK_JSON_ARROW, TK_JSON_TEXT_ARROW, TK_BAD } TokenKind;
+typedef struct { const char* cursor; TokenKind kind; char text[MAX_VAL_LEN]; bool failed; const char* token_start; const char* statement_start; } Parser;
 typedef struct { char table[MAX_NAME_LEN], column[MAX_NAME_LEN]; } ColumnName;
 typedef struct { int table, column; } Binding;
 #define MAX_SCOPE_TABLES 8
@@ -241,12 +357,12 @@ typedef struct {
 typedef enum {
    PRED_EQ = TK_EQ, PRED_NE = TK_NE, PRED_LT = TK_LT, PRED_LE = TK_LE,
    PRED_GT = TK_GT, PRED_GE = TK_GE,
-   PRED_LIKE = 100, PRED_IN, PRED_NOT_IN, PRED_BETWEEN,
+   PRED_LIKE = 100, PRED_ILIKE, PRED_IN, PRED_NOT_IN, PRED_BETWEEN,
    PRED_EXISTS, PRED_NOT_EXISTS
 } PredicateOp;
 #define MAX_SUBQUERY_LEN 512
 typedef struct {
-   Binding left, right; bool right_column, is_null_test, negate;
+   Binding left, right; bool right_column, is_null_test, negate, is_rownum;
    int op; Value value; Value value2;
    Value in_values[16]; int in_count;
    char expr_op; Value expr_operand;
@@ -269,7 +385,7 @@ typedef struct {
    Value (*rows)[MAX_COLUMNS];
    bool silent;
 } QueryResultCapture;
-extern QueryResultCapture* g_result_capture;
+extern THREAD_LOCAL QueryResultCapture* g_result_capture;
 /* Versioned, little-endian snapshots contain no pointers or compiler struct padding. */
 typedef struct { unsigned char* data; size_t size, capacity, offset; bool ok; } Image;
 
@@ -285,7 +401,15 @@ typedef struct { int capacity, mask; int* buckets; JoinHashEntry* entries; int e
 #define PAGE_TYPE_DATA 1
 #define PAGE_TYPE_BTREE_INTERNAL 2
 #define PAGE_TYPE_BTREE_LEAF 3
-#define BUFFER_POOL_FRAMES 64
+#define PAGE_TYPE_OVERFLOW 4
+#define BUFFER_POOL_FRAMES 256
+#define BUFFER_POOL_HASH_SIZE 512
+
+typedef struct {
+    uint32_t next_page;
+    uint16_t data_len;
+    uint16_t reserved;
+} OverflowPageHeader;
 
 typedef struct {
     uint32_t page_id;
@@ -308,10 +432,17 @@ typedef struct {
 } BufferFrame;
 
 typedef struct {
-    BufferFrame frames[BUFFER_POOL_FRAMES];
+    BufferFrame* frames;
+    int* hash_table;
+    int* hash_next;
+    uint32_t frame_count;
+    uint32_t hash_size;
     uint32_t clock_hand;
     uint32_t page_count;
 } BufferPool;
+
+extern uint32_t g_buffer_pool_size_mb;
+void buffer_pool_init_sized(BufferPool* bp, uint32_t pool_mb);
 
 /* Phase 3: WAL definitions */
 #define WAL_MAGIC 0x57414C31
@@ -333,8 +464,12 @@ typedef struct {
 
 extern Database *g_db, *g_committed;
 extern bool g_pending, g_timing, g_io_uncertain, g_readonly, g_autocommit;
+extern bool g_silent_mode;
 extern bool g_interactive_shell;
+extern bool g_self_test_running;
+extern bool g_pager_enabled;
 extern bool g_semicolon_optional;
+extern bool g_confirm_destructive;
 extern char g_null_str[32];
 extern int g_max_rows;
 extern FILE* g_spool_file;
@@ -345,10 +480,17 @@ extern char g_path[PATH_CAP], g_backup_dir[PATH_CAP];
 extern unsigned g_backup_interval;
 extern atomic_bool g_stop, g_backup_failed;
 extern atomic_ullong g_backup_generation, g_backup_time;
-extern const Scope* g_outer_scope;
-extern char g_network_user[MAX_NAME_LEN];
-extern bool g_network_tls_active;
-extern char g_last_error[MAX_VAL_LEN];
+extern THREAD_LOCAL const Scope* g_outer_scope;
+extern THREAD_LOCAL char g_network_user[MAX_NAME_LEN];
+extern THREAD_LOCAL UserRole g_network_user_role;
+extern THREAD_LOCAL bool g_network_tls_active;
+extern uint32_t g_statement_timeout_ms;
+extern THREAD_LOCAL uint64_t g_query_start_time_ms;
+bool is_query_timed_out(void);
+extern bool g_autovacuum_enabled;
+extern double g_autovacuum_threshold;
+int run_autovacuum_sweep(Database* db);
+extern THREAD_LOCAL char g_last_error[MAX_VAL_LEN];
 
 /* User configuration and error reporting */
 extern char g_config_path[PATH_CAP];
@@ -416,6 +558,8 @@ void join_index_destroy(JoinIndex* index);
 int join_index_first(const JoinIndex* index, const Value* val);
 void lock_snapshot_io(void);
 void lock_engine_state(void);
+void lock_engine_shared(void);
+void unlock_engine_shared(void);
 double monotonic_seconds(void);
 bool normalize_decimal(const char* text, char* output);
 bool open_or_restore_database(const char* restore);
@@ -454,6 +598,41 @@ bool set_user_password(UserAccount* account, const char* password);
 bool create_bootstrap_admin(const char* name, const char* password);
 bool validate_user_name(const char* name);
 
+bool read_masked_password(const char* prompt, char* buf, size_t max_len);
+int edit_distance_capped(const char* a, const char* b, int cap);
+const char* suggest_table_name(const Database* db, const char* name);
+const char* suggest_column_name(const Table* tbl, const char* col);
+bool report_table_not_found(const Database* db, const char* name);
+bool report_column_not_found(const Table* tbl, const char* col);
+bool is_supported_db_filename(const char* name);
+void format_human_size(uint64_t bytes, char* out, size_t out_len);
+void show_destructive_dry_run(const char* action, const char* target_name, const char* extra_info);
+void format_relative_timestamp(time_t t, char* out, size_t out_len);
+void load_history_file(void);
+void save_history_file(void);
+void record_history_entry(const char* stmt);
+const char* get_history_entry(int index);
+int get_history_count(void);
+bool history_expand(const char* in, char* out, size_t out_len);
+char* read_interactive_line(const char* prompt, char* line_buf, size_t max_len);
+
+#define SHELL_KEY_NONE      0
+#define SHELL_KEY_ENTER     10
+#define SHELL_KEY_BACKSPACE 127
+#define SHELL_KEY_TAB       9
+#define SHELL_KEY_CTRL_C    3
+#define SHELL_KEY_CTRL_D    4
+#define SHELL_KEY_CTRL_R    18
+#define SHELL_KEY_UP        1001
+#define SHELL_KEY_DOWN      1002
+#define SHELL_KEY_LEFT      1003
+#define SHELL_KEY_RIGHT     1004
+#define SHELL_KEY_HOME      1005
+#define SHELL_KEY_END       1006
+#define SHELL_KEY_DELETE    1007
+
+int shell_read_key(void);
+
 /* Embedded C library API */
 bool opendata_open(const char* db_path, const char* backup_dir, unsigned backup_interval, const char* restore_path);
 bool opendata_open_readonly(const char* db_path);
@@ -468,6 +647,7 @@ uint64_t opendata_get_generation(void);
 bool opendata_has_pending_changes(void);
 int opendata_get_error_count(void);
 void opendata_close(void);
+
 
 typedef struct OpendataStmt OpendataStmt;
 OpendataStmt* opendata_prepare(const char* sql);
@@ -498,6 +678,13 @@ bool opendata_ctx_commit(OpendataCtx* ctx);
 bool opendata_ctx_rollback(OpendataCtx* ctx);
 void opendata_ctx_close(OpendataCtx* ctx);
 void opendata_ctx_destroy(OpendataCtx* ctx);
+const char* opendata_errmsg(void);
+const char* opendata_ctx_errmsg(OpendataCtx* ctx);
+bool opendata_bind_double(OpendataStmt* stmt, int param_idx, double val);
+bool opendata_bind_vector(OpendataStmt* stmt, int param_idx, const float* vec, int dim);
+int64_t opendata_column_int64(OpendataStmt* stmt, int col_idx);
+double opendata_column_double(OpendataStmt* stmt, int col_idx);
+int opendata_column_vector(OpendataStmt* stmt, int col_idx, float* out_vec, int max_dim);
 
 /* Phase 1: Slotted Binary Rows */
 size_t encode_slotted_row(const ColumnDef* cols, int col_count, const Row* row, uint8_t* dest, size_t max_size);
@@ -516,6 +703,8 @@ void buffer_pool_unpin(BufferPool* bp, uint32_t page_id, bool is_dirty);
 bool buffer_pool_flush_all(BufferPool* bp, int fd);
 uint32_t buffer_pool_alloc_page(BufferPool* bp, int fd, uint16_t page_type);
 void buffer_pool_destroy(BufferPool* bp, int fd);
+bool slotted_overflow_write(BufferPool* bp, int fd, const uint8_t* data, size_t len, uint32_t* out_first_page);
+bool slotted_overflow_read(BufferPool* bp, int fd, uint32_t first_page, uint8_t* dest, size_t dest_cap, size_t* out_len);
 
 /* Phase 3: Write-Ahead Logging (WAL) */
 bool wal_init(const char* base_path);
@@ -524,6 +713,8 @@ bool wal_commit_tx(uint32_t tx_id);
 bool wal_checkpoint_now(BufferPool* bp, int db_fd);
 bool wal_recover_and_replay(int db_fd, BufferPool* bp);
 bool wal_recover_and_replay_to_timestamp(int db_fd, BufferPool* bp, uint32_t target_timestamp);
+bool wal_archive_segment(const char* archive_dir);
+bool wal_pitr_restore(const char* db_path, const char* archive_dir, uint32_t target_ts);
 void wal_shutdown(void);
 
 /* Phase 4: Persistent On-Disk B+ Tree Index */
@@ -557,7 +748,11 @@ void set_backup_worker_handle(pthread_t t);
 typedef enum {
     FORMAT_TABLE = 0,
     FORMAT_CSV = 1,
-    FORMAT_JSON = 2
+    FORMAT_JSON = 2,
+    FORMAT_BOX = 3,
+    FORMAT_MARKDOWN = 4,
+    FORMAT_VERTICAL = 5,
+    FORMAT_TSV = 6
 } OutputFormat;
 
 extern OutputFormat g_output_format;
@@ -633,6 +828,7 @@ typedef struct ClusterTlsContext ClusterTlsContext;
 typedef struct ClusterTlsStream ClusterTlsStream;
 
 extern bool g_sync_replication;
+extern bool g_cluster_plaintext_mode;
 /* Written by the cluster worker thread, read by the network/main threads. */
 extern _Atomic RaftRole g_raft_role;
 extern int g_raft_node_id;
@@ -723,6 +919,14 @@ void secondary_index_insert_row(Database* db, int table_idx, int row_idx);
 void secondary_index_remove_row(Database* db, int table_idx, int row_idx);
 int secondary_index_find_range(const SecondaryIndex* idx, DataType type, const Value* low, const Value* high, int* out_rows, int max_rows);
 
+/* HNSW Vector Indexing */
+bool execute_create_hnsw_index_in_db(Database* db, const char* idx_name, const char* tbl_name, const char* col_name, int metric);
+bool hnsw_index_build(SecondaryIndex* idx, const Table* table, int col_idx);
+void hnsw_index_destroy(SecondaryIndex* idx);
+void* hnsw_index_copy(const void* graph);
+int hnsw_index_search(const SecondaryIndex* idx, const float* query_vec, int dim, int k, int* out_rows, float* out_dists);
+void hnsw_index_insert_row(SecondaryIndex* idx, const Table* table, int row_idx);
+
 /* Cost-Based Optimizer (CBO) & Statistics */
 bool execute_analyze_table(const char* table_name);
 bool execute_analyze_all(void);
@@ -769,6 +973,9 @@ int get_active_session_count(void);
 
 /* Phase 4: Native VECTOR(dim) SIMD Distance Functions */
 int parse_vector_floats(const char* text, float* out_vals, int max_dim);
+bool vector_quantize_sq8(const float* vec, int dim, VectorSQ8* out_sq8);
+double vector_sq8_cosine_distance(const VectorSQ8* a, const VectorSQ8* b);
+double vector_sq8_l2_distance(const VectorSQ8* a, const VectorSQ8* b);
 double vector_cosine_distance(const char* a, const char* b);
 double vector_l2_distance(const char* a, const char* b);
 
@@ -783,5 +990,24 @@ bool opendata_export_oracle(const char* table_name, const char* filepath);
 bool opendata_import_oracle(const char* table_name, const char* filepath);
 bool dump_database_sql(const Database* db, const char* filepath);
 bool diff_database_schema(const Database* db, const char* other_db_path);
+
+/* Active Directory & LDAP Directory Authentication */
+bool authenticate_directory_user(const char* username, const char* password, UserRole* out_role);
+bool is_directory_auth_enabled(void);
+void configure_directory_ad(const char* server, const char* domain, const char* admin_group);
+void configure_directory_ldap(const char* server, int port, bool use_ssl, const char* base_dn, const char* user_attr, const char* admin_group);
+void configure_kerberos(const char* service, const char* realm, const char* keytab);
+bool is_kerberos_enabled(void);
+bool authenticate_kerberos_ticket(const void* in_token, size_t in_len, void* out_token, size_t* out_len, char* out_user, size_t user_cap, UserRole* out_role);
+
+#ifdef _WIN32
+bool install_windows_service(const char* service_name, const char* display_name, const char* db_path, int port);
+bool uninstall_windows_service(const char* service_name);
+bool start_windows_service(const char* service_name);
+bool stop_windows_service(const char* service_name);
+#endif
+
+/* Built-In Enterprise Self-Test Suite */
+bool execute_self_test(const char* filter);
 
 #endif

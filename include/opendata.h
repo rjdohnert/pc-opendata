@@ -79,6 +79,7 @@ bool opendata_has_pending_changes(void);
  * Return the cumulative count of errors encountered since startup.
  */
 int opendata_get_error_count(void);
+const char* opendata_errmsg(void);
 
 /*
  * Open the database in read-only mode for Single-Writer / Multi-Reader (SWMR) concurrency.
@@ -95,12 +96,17 @@ typedef struct OpendataStmt OpendataStmt;
 
 OpendataStmt* opendata_prepare(const char* sql);
 bool opendata_bind_int(OpendataStmt* stmt, int param_idx, int64_t val);
+bool opendata_bind_double(OpendataStmt* stmt, int param_idx, double val);
 bool opendata_bind_text(OpendataStmt* stmt, int param_idx, const char* str);
+bool opendata_bind_vector(OpendataStmt* stmt, int param_idx, const float* vec, int dim);
 bool opendata_bind_null(OpendataStmt* stmt, int param_idx);
 bool opendata_step(OpendataStmt* stmt);
 int opendata_column_count(OpendataStmt* stmt);
 const char* opendata_column_name(OpendataStmt* stmt, int col_idx);
 const char* opendata_column_text(OpendataStmt* stmt, int col_idx);
+int64_t opendata_column_int64(OpendataStmt* stmt, int col_idx);
+double opendata_column_double(OpendataStmt* stmt, int col_idx);
+int opendata_column_vector(OpendataStmt* stmt, int col_idx, float* out_vec, int max_dim);
 bool opendata_column_is_null(OpendataStmt* stmt, int col_idx);
 bool opendata_reset(OpendataStmt* stmt);
 void opendata_finalize(OpendataStmt* stmt);
@@ -133,6 +139,7 @@ bool opendata_ctx_commit(OpendataCtx* ctx);
 bool opendata_ctx_rollback(OpendataCtx* ctx);
 void opendata_ctx_close(OpendataCtx* ctx);
 void opendata_ctx_destroy(OpendataCtx* ctx);
+const char* opendata_ctx_errmsg(OpendataCtx* ctx);
 
 /*
  * Stop periodic backup worker, publish clean shutdown backup, release database lock,

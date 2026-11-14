@@ -47,7 +47,7 @@ static bool parse_fk_actions(Parser* p, ColumnDef* c) {
 static bool parse_single_column_def(Parser* p, Table* table, ColumnDef* c, bool* primary) {
     memset(c, 0, sizeof(*c));
     c->nullable = true;
-    if (!parse_identifier(p, c->name) || find_column_index(table, c->name) >= 0) return false;
+    if (!parse_identifier(p, c->name) || (table && find_column_index(table, c->name) >= 0)) return false;
     if (consume_keyword(p, "NUMBER") || consume_keyword(p, "INT") || consume_keyword(p, "INTEGER") ||
         consume_keyword(p, "BIGINT") || consume_keyword(p, "SMALLINT") || consume_keyword(p, "TINYINT") ||
         consume_keyword(p, "BIT") || consume_keyword(p, "FLOAT") || consume_keyword(p, "REAL") ||
@@ -56,6 +56,13 @@ static bool parse_single_column_def(Parser* p, Table* table, ColumnDef* c, bool*
         c->type = TYPE_NUMBER;
         c->size = 40;
         if (!parse_optional_precision_scale(p)) return false;
+    } else if (consume_keyword(p, "SERIAL") || consume_keyword(p, "BIGSERIAL")) {
+        c->type = TYPE_NUMBER;
+        c->size = 40;
+        c->auto_increment = true;
+    } else if (consume_keyword(p, "BOOLEAN") || consume_keyword(p, "BOOL")) {
+        c->type = TYPE_NUMBER;
+        c->size = 40;
     } else if (consume_keyword(p, "DATE") || consume_keyword(p, "DATETIME") ||
                consume_keyword(p, "DATETIME2") || consume_keyword(p, "SMALLDATETIME") ||
                consume_keyword(p, "TIMESTAMP")) {
@@ -73,22 +80,23 @@ static bool parse_single_column_def(Parser* p, Table* table, ColumnDef* c, bool*
         if (!consume_token(p, TK_RP)) return false;
     } else if (consume_keyword(p, "VARCHAR2") || consume_keyword(p, "VARCHAR") ||
                consume_keyword(p, "NVARCHAR") || consume_keyword(p, "NVARCHAR2") ||
-               consume_keyword(p, "RAW")) {
-        if (!consume_token(p, TK_LP)) return false;
+               consume_keyword(p, "RAW") || consume_keyword(p, "STRING")) {
         long size = 255;
-        if (consume_keyword(p, "MAX")) {
-            size = 255;
-        } else {
-            if (p->kind != TK_NUMBER || strspn(p->text, "0123456789") != strlen(p->text)) return false;
-            errno = 0;
-            size = strtol(p->text, NULL, 10);
-            if (errno || size < 1 || size >= MAX_VAL_LEN) return false;
-            scan_next_token(p);
-            if (!consume_keyword(p, "BYTE")) consume_keyword(p, "CHAR");
+        if (consume_token(p, TK_LP)) {
+            if (consume_keyword(p, "MAX")) {
+                size = 255;
+            } else {
+                if (p->kind != TK_NUMBER || strspn(p->text, "0123456789") != strlen(p->text)) return false;
+                errno = 0;
+                size = strtol(p->text, NULL, 10);
+                if (errno || size < 1 || size >= MAX_VAL_LEN) return false;
+                scan_next_token(p);
+                if (!consume_keyword(p, "BYTE")) consume_keyword(p, "CHAR");
+            }
+            if (!consume_token(p, TK_RP)) return false;
         }
         c->type = TYPE_VARCHAR2;
         c->size = (int)size;
-        if (!consume_token(p, TK_RP)) return false;
     } else if (consume_keyword(p, "CHAR") || consume_keyword(p, "NCHAR")) {
         long size = 1;
         if (consume_token(p, TK_LP)) {
@@ -103,17 +111,65 @@ static bool parse_single_column_def(Parser* p, Table* table, ColumnDef* c, bool*
         c->type = TYPE_VARCHAR2;
         c->size = (int)size;
     } else if (consume_keyword(p, "CLOB") || consume_keyword(p, "BLOB") ||
-               consume_keyword(p, "TEXT") || consume_keyword(p, "NTEXT")) {
+               consume_keyword(p, "TEXT") || consume_keyword(p, "NTEXT") ||
+               consume_keyword(p, "XML")) {
         c->type = TYPE_VARCHAR2;
         c->size = 255;
+    } else if (consume_keyword(p, "UNIQUEIDENTIFIER") || consume_keyword(p, "UUID") || consume_keyword(p, "GUID")) {
+        c->type = TYPE_VARCHAR2;
+        c->size = 36;
+    } else if (consume_keyword(p, "ROWID") || consume_keyword(p, "UROWID")) {
+        c->type = TYPE_VARCHAR2;
+        c->size = 18;
+    } else if (consume_keyword(p, "VARBINARY") || consume_keyword(p, "IMAGE") || consume_keyword(p, "BINARY")) {
+        long size = 255;
+        if (consume_token(p, TK_LP)) {
+            if (consume_keyword(p, "MAX")) {
+                size = 255;
+            } else if (p->kind == TK_NUMBER) {
+                errno = 0;
+                size = strtol(p->text, NULL, 10);
+                if (errno || size < 1 || size >= MAX_VAL_LEN) size = 255;
+                scan_next_token(p);
+            }
+            if (!consume_token(p, TK_RP)) return false;
+        }
+        c->type = TYPE_VARCHAR2;
+        c->size = (int)size;
     } else return false;
 
     bool saw_not_null = false, saw_unique = false, saw_ref = false;
     for (;;) {
         if (consume_keyword(p, "CONSTRAINT")) {
             if (!parse_identifier(p, c->constraint_name)) return false;
-        } else if (consume_keyword(p, "IDENTITY")) {
-            if (!parse_optional_precision_scale(p)) return false;
+        } else if (consume_keyword(p, "IDENTITY") || consume_keyword(p, "AUTO_INCREMENT") || consume_keyword(p, "AUTOINCREMENT")) {
+            c->auto_increment = true;
+            if (token_is_keyword(p, "IDENTITY")) parse_optional_precision_scale(p);
+            else if (consume_token(p, TK_LP)) {
+                while (p->kind != TK_RP && p->kind != TK_END) scan_next_token(p);
+                consume_token(p, TK_RP);
+            }
+        } else if (consume_keyword(p, "DEFAULT")) {
+            c->has_default = true;
+            if (consume_keyword(p, "NULL")) {
+                c->default_value[0] = '\0';
+            } else if (consume_keyword(p, "CURRENT_TIMESTAMP") || consume_keyword(p, "NOW") || consume_keyword(p, "SYSDATE")) {
+                time_t now = time(NULL);
+                struct tm tm_val;
+#ifdef _WIN32
+                gmtime_s(&tm_val, &now);
+#else
+                gmtime_r(&now, &tm_val);
+#endif
+                strftime(c->default_value, sizeof(c->default_value), "%Y-%m-%d %H:%M:%S", &tm_val);
+            } else if (consume_keyword(p, "TRUE")) {
+                strcpy(c->default_value, "1");
+            } else if (consume_keyword(p, "FALSE")) {
+                strcpy(c->default_value, "0");
+            } else if (p->kind == TK_NUMBER || p->kind == TK_STRING) {
+                snprintf(c->default_value, sizeof(c->default_value), "%s", p->text);
+                scan_next_token(p);
+            }
         } else if (consume_keyword(p, "NOT")) {
             if (saw_not_null || !consume_keyword(p, "NULL")) return false;
             saw_not_null = true; c->nullable = false;
@@ -138,11 +194,73 @@ static bool parse_single_column_def(Parser* p, Table* table, ColumnDef* c, bool*
 
 bool execute_create_table(Parser* p, Database* db) {
     if (!consume_keyword(p, "TABLE")) return false;
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: CREATE TABLE requires the ADMIN role");
+    bool if_not_exists = false;
+    if (consume_keyword(p, "IF")) {
+        if (!consume_keyword(p, "NOT") || !consume_keyword(p, "EXISTS")) return false;
+        if_not_exists = true;
+    }
     if (db->table_count == MAX_TABLES) return report_database_error("table limit reached");
+    char tbl_name[MAX_NAME_LEN];
+    if (!parse_identifier(p, tbl_name) || !strcmp(tbl_name, "DUAL")) return false;
+    if (consume_token(p, TK_DOT)) {
+        char subname[MAX_NAME_LEN];
+        if (!parse_identifier(p, subname) || !strcmp(subname, "DUAL")) return false;
+        snprintf(tbl_name, sizeof(tbl_name), "%s", subname);
+    }
+    if (find_table_index(db, tbl_name) >= 0) {
+        if (if_not_exists) {
+            while (p->kind != TK_SEMI && p->kind != TK_END && !p->failed) {
+                scan_next_token(p);
+            }
+            consume_token(p, TK_SEMI);
+            return true;
+        }
+        return report_database_error("table already exists: %s", tbl_name);
+    }
+
+    if (consume_keyword(p, "AS")) {
+        if (!consume_keyword(p, "SELECT")) return report_database_error("expected SELECT after AS in CREATE TABLE");
+        QueryResultCapture cap = {0};
+        cap.silent = true;
+        QueryResultCapture* old_cap = g_result_capture;
+        g_result_capture = &cap;
+        bool sel_ok = execute_select_query(p);
+        g_result_capture = old_cap;
+        if (!sel_ok) {
+            free(cap.rows);
+            return false;
+        }
+        Table* table = &db->tables[db->table_count];
+        memset(table, 0, sizeof(*table));
+        memcpy(table->name, tbl_name, sizeof(table->name));
+        table->col_count = cap.col_count;
+        for (int c = 0; c < cap.col_count; c++) {
+            memcpy(table->columns[c].name, cap.col_names[c], sizeof(table->columns[c].name));
+            table->columns[c].type = TYPE_VARCHAR2;
+            table->columns[c].size = 255;
+            table->columns[c].nullable = true;
+        }
+        if (!allocate_table_storage(table, cap.row_count > 0 ? cap.row_count : 16)) {
+            free(cap.rows);
+            return report_database_error("failed to allocate table storage");
+        }
+        for (int r = 0; r < cap.row_count; r++) {
+            for (int c = 0; c < cap.col_count; c++) {
+                table->rows[r].values[c] = cap.rows[r][c];
+            }
+            table->row_count++;
+        }
+        free(cap.rows);
+        db->table_count++;
+        return true;
+    }
+
     Table* table = &db->tables[db->table_count];
     memset(table, 0, sizeof(*table));
-    if (!parse_identifier(p, table->name) || !strcmp(table->name, "DUAL") ||
-        find_table_index(db, table->name) >= 0 || !consume_token(p, TK_LP)) return false;
+    memcpy(table->name, tbl_name, sizeof(table->name));
+    if (!consume_token(p, TK_LP)) return false;
     bool primary = false;
     do {
         char cname[MAX_NAME_LEN] = {0};
@@ -304,14 +422,24 @@ bool execute_create_table(Parser* p, Database* db) {
 
 bool execute_drop_table(Parser* p, Database* db) {
     char name[MAX_NAME_LEN];
-    if (!consume_keyword(p, "TABLE") || !parse_identifier(p, name) || !consume_statement_end(p)) return false;
+    if (!consume_keyword(p, "TABLE")) return false;
+    bool if_exists = false;
+    if (consume_keyword(p, "IF")) {
+        if (!consume_keyword(p, "EXISTS")) return false;
+        if_exists = true;
+    }
+    if (!parse_identifier(p, name) || !consume_statement_end(p)) return false;
     int t = find_table_index(db, name);
-    if (t < 0) return report_database_error("table does not exist: %s", name);
-    if (g_network_user[0])
+    if (t < 0) {
+        if (if_exists) return true;
+        return report_table_not_found(db, name);
+    }
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
         return report_database_error("permission denied: DROP TABLE requires the ADMIN role");
     for (int i = 0; i < db->index_count; ) {
         if (strcmp(db->indexes[i].table_name, name) == 0) {
-            if (db->indexes[i].entries) free(db->indexes[i].entries);
+            if (db->indexes[i].is_hnsw) hnsw_index_destroy(&db->indexes[i]);
+            else free(db->indexes[i].entries);
             for (int j = i; j + 1 < db->index_count; j++) {
                 db->indexes[j] = db->indexes[j + 1];
             }
@@ -351,7 +479,11 @@ bool execute_truncate_table(Parser* p, Database* db) {
     table->stats.is_analyzed = false;
     for (int i = 0; i < db->index_count; i++) {
         if (strcmp(db->indexes[i].table_name, table->name) == 0) {
-            db->indexes[i].entry_count = 0;
+            if (db->indexes[i].is_hnsw) {
+                hnsw_index_build(&db->indexes[i], table, db->indexes[i].col_idx);
+            } else {
+                db->indexes[i].entry_count = 0;
+            }
         }
     }
     return true;
@@ -361,7 +493,7 @@ bool execute_alter_table(Parser* p, Database* db) {
     if (!consume_keyword(p, "TABLE")) return false;
     Table* table = resolve_statement_table(p, db);
     if (!table) return false;
-    if (g_network_user[0])
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
         return report_database_error("permission denied: ALTER TABLE requires the ADMIN role");
     if (consume_keyword(p, "ADD")) {
         if (consume_keyword(p, "CONSTRAINT")) {
@@ -437,6 +569,16 @@ bool execute_alter_table(Parser* p, Database* db) {
             return false;
         }
         consume_keyword(p, "COLUMN");
+        bool if_not_exists = false;
+        if (consume_keyword(p, "IF")) {
+            if (!consume_keyword(p, "NOT") || !consume_keyword(p, "EXISTS")) return false;
+            if_not_exists = true;
+        }
+        if (if_not_exists && p->kind == TK_ID && find_column_index(table, p->text) >= 0) {
+            while (p->kind != TK_SEMI && p->kind != TK_END && !p->failed) scan_next_token(p);
+            consume_token(p, TK_SEMI);
+            return true;
+        }
         if (table->col_count == MAX_COLUMNS) return report_database_error("column limit reached");
         bool primary = false;
         for (int c = 0; c < table->col_count; c++) if (table->columns[c].primary) primary = true;
@@ -518,11 +660,21 @@ bool execute_alter_table(Parser* p, Database* db) {
             return true;
         }
         consume_keyword(p, "COLUMN");
+        bool if_exists = false;
+        if (consume_keyword(p, "IF")) {
+            if (!consume_keyword(p, "EXISTS")) return false;
+            if_exists = true;
+        }
         char col_name[MAX_NAME_LEN];
         if (!parse_identifier(p, col_name) || !consume_statement_end(p)) return false;
         int col_idx = find_column_index(table, col_name);
-        if (col_idx < 0) return report_database_error("column does not exist: %s", col_name);
+        if (col_idx < 0) {
+            if (if_exists) return true;
+            return report_column_not_found(table, col_name);
+        }
         if (table->col_count <= 1) return report_database_error("cannot drop only column from table");
+        if (table->part_type != PART_NONE && table->part_col_idx == col_idx)
+            return report_database_error("cannot drop partition key column: %s", col_name);
         for (int t = 0; t < db->table_count; t++) {
             Table* other = &db->tables[t];
             for (int c = 0; c < other->col_count; c++) {
@@ -570,11 +722,15 @@ bool execute_alter_table(Parser* p, Database* db) {
                 }
             }
         }
+        if (table->part_type != PART_NONE && table->part_col_idx > col_idx) {
+            table->part_col_idx--;
+        }
         /* Drop or shift secondary indexes referencing this table's columns. */
         for (int i = 0; i < db->index_count; ) {
             if (strcmp(db->indexes[i].table_name, table->name) == 0) {
                 if (db->indexes[i].col_idx == col_idx) {
-                    free(db->indexes[i].entries);
+                    if (db->indexes[i].is_hnsw) hnsw_index_destroy(&db->indexes[i]);
+                    else free(db->indexes[i].entries);
                     for (int j = i; j + 1 < db->index_count; j++)
                         db->indexes[j] = db->indexes[j + 1];
                     db->index_count--;
@@ -583,7 +739,10 @@ bool execute_alter_table(Parser* p, Database* db) {
                 }
                 if (db->indexes[i].col_idx > col_idx) {
                     db->indexes[i].col_idx--;
-                    build_secondary_index(&db->indexes[i], table, db->indexes[i].col_idx);
+                    if (db->indexes[i].is_hnsw)
+                        hnsw_index_build(&db->indexes[i], table, db->indexes[i].col_idx);
+                    else
+                        build_secondary_index(&db->indexes[i], table, db->indexes[i].col_idx);
                 }
             }
             i++;
@@ -632,8 +791,39 @@ bool execute_alter_table(Parser* p, Database* db) {
                     memcpy(db->indexes[i].table_name, new_tbl_name, sizeof(db->indexes[i].table_name));
                 }
             }
+            for (int i = 0; i < db->grant_count; i++) {
+                if (!strcmp(db->grants[i].table, old_tbl_name)) {
+                    memcpy(db->grants[i].table, new_tbl_name, sizeof(db->grants[i].table));
+                }
+            }
             return true;
         }
+    }
+    if (consume_keyword(p, "MODIFY")) {
+        consume_keyword(p, "COLUMN");
+        bool primary = false;
+        ColumnDef dummy_col;
+        if (!parse_single_column_def(p, NULL, &dummy_col, &primary)) return false;
+        int col_idx = find_column_index(table, dummy_col.name);
+        if (col_idx < 0) return report_column_not_found(table, dummy_col.name);
+        if (!consume_statement_end(p)) return false;
+        for (int r = 0; r < table->row_count; r++) {
+            if (!dummy_col.nullable && table->rows[r].values[col_idx].is_null) {
+                return report_database_error("column '%s' contains NULL values; cannot modify to NOT NULL", dummy_col.name);
+            }
+            if (!table->rows[r].values[col_idx].is_null &&
+                !is_valid_column_value(&dummy_col, &table->rows[r].values[col_idx])) {
+                return report_database_error("existing value in row %d exceeds new column specification", r + 1);
+            }
+        }
+        table->columns[col_idx].type = dummy_col.type;
+        table->columns[col_idx].size = dummy_col.size;
+        table->columns[col_idx].nullable = dummy_col.nullable;
+        if (dummy_col.has_default) {
+            table->columns[col_idx].has_default = true;
+            memcpy(table->columns[col_idx].default_value, dummy_col.default_value, sizeof(table->columns[col_idx].default_value));
+        }
+        return true;
     }
     return false;
 }
@@ -641,7 +831,18 @@ bool execute_alter_table(Parser* p, Database* db) {
 Table* resolve_statement_table(Parser* p, Database* db) {
     char name[MAX_NAME_LEN];
     if (!parse_identifier(p, name)) return NULL;
+    if (consume_token(p, TK_DOT)) {
+        char subname[MAX_NAME_LEN];
+        if (!parse_identifier(p, subname)) return NULL;
+        int t = find_table_index(db, subname);
+        if (t >= 0) return &db->tables[t];
+        char fq[MAX_NAME_LEN];
+        snprintf(fq, sizeof(fq), "%s.%s", name, subname);
+        t = find_table_index(db, fq);
+        if (t >= 0) return &db->tables[t];
+        snprintf(name, sizeof(name), "%s", subname);
+    }
     int t = find_table_index(db, name);
-    if (t < 0) { report_database_error("table does not exist: %s", name); return NULL; }
+    if (t < 0) { report_table_not_found(db, name); return NULL; }
     return &db->tables[t];
 }

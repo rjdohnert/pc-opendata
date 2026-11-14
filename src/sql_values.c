@@ -122,6 +122,59 @@ int parse_vector_floats(const char* text, float* out_vals, int max_dim) {
     return -1;
 }
 
+bool vector_quantize_sq8(const float* vec, int dim, VectorSQ8* out_sq8) {
+    if (!vec || dim <= 0 || dim > 64 || !out_sq8) return false;
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float a = fabsf(vec[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    float scale = (max_abs > 1e-7f) ? (max_abs / 127.0f) : 1.0f;
+    out_sq8->scale = scale;
+    out_sq8->dim = dim;
+    for (int i = 0; i < dim; i++) {
+        float q = roundf(vec[i] / scale);
+        if (q > 127.0f) q = 127.0f;
+        if (q < -128.0f) q = -128.0f;
+        out_sq8->q[i] = (int8_t)q;
+    }
+    return true;
+}
+
+double vector_sq8_cosine_distance(const VectorSQ8* a, const VectorSQ8* b) {
+    if (!a || !b || a->dim <= 0 || a->dim != b->dim) return 1.0;
+    int32_t dot_q = 0;
+    int32_t na_q = 0;
+    int32_t nb_q = 0;
+    int dim = a->dim;
+    for (int i = 0; i < dim; i++) {
+        int32_t qa = (int32_t)a->q[i];
+        int32_t qb = (int32_t)b->q[i];
+        dot_q += qa * qb;
+        na_q += qa * qa;
+        nb_q += qb * qb;
+    }
+    double denom = sqrt((double)na_q) * sqrt((double)nb_q);
+    if (denom <= 1e-9) return 1.0;
+    double sim = (double)dot_q / denom;
+    if (sim > 1.0) sim = 1.0;
+    if (sim < -1.0) sim = -1.0;
+    return 1.0 - sim;
+}
+
+double vector_sq8_l2_distance(const VectorSQ8* a, const VectorSQ8* b) {
+    if (!a || !b || a->dim <= 0 || a->dim != b->dim) return 1e30;
+    double sum_sq = 0.0;
+    double sa = (double)a->scale;
+    double sb = (double)b->scale;
+    int dim = a->dim;
+    for (int i = 0; i < dim; i++) {
+        double diff = ((double)a->q[i] * sa) - ((double)b->q[i] * sb);
+        sum_sq += diff * diff;
+    }
+    return sqrt(sum_sq);
+}
+
 double vector_cosine_distance(const char* a, const char* b) {
     float va[64], vb[64];
     int da = parse_vector_floats(a, va, 64);

@@ -1,0 +1,49 @@
+name: Clang validation
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build modular layout with Clang & run self-tests
+        shell: powershell
+        run: .\build.ps1 -Compiler clang
+      - name: Build amalgamated layout with Clang & run self-tests
+        shell: powershell
+        run: .\build.ps1 -Compiler clang -Amalgamation
+      - name: Verify CLI command execution
+        shell: powershell
+        run: |
+          .\bin\opendata.exe --help
+          .\bin\opendata.exe --version
+      - name: Generate SHA-256 checksums
+        shell: powershell
+        run: |
+          Get-FileHash -Algorithm SHA256 .\bin\opendata.exe, .\src\opendata.c, .\installer\OpenDataSQL-Setup.zip |
+            ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } |
+            Out-File -Encoding ascii SHA256SUMS-windows.txt
+          Get-Content SHA256SUMS-windows.txt
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install TLS development files
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev openssl
+      - name: Compile modular and amalgamated binaries
+        run: |
+          chmod +x build-scripts/wsl-build.sh
+          OPENDATA_TLS=1 bash build-scripts/wsl-build.sh
+      - name: Run modular self-test suite
+        run: ./bin/opendata self-test
+      - name: Run amalgamation self-test suite
+        run: ./bin/opendata_amalgamated self-test
+      - name: Generate SHA-256 checksums
+        run: |
+          sha256sum bin/opendata bin/opendata_amalgamated src/opendata.c > SHA256SUMS-linux.txt
+          cat SHA256SUMS-linux.txt

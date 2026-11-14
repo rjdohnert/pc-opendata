@@ -189,7 +189,7 @@ bool acquire_database_file_lock(void) {
 
 void release_database_file_lock(void) {
 #ifdef _WIN32
-    if (g_file_lock != INVALID_HANDLE_VALUE) {
+    if (g_file_lock != INVALID_HANDLE_VALUE && g_file_lock != NULL) {
         CloseHandle(g_file_lock);
         g_file_lock = INVALID_HANDLE_VALUE;
     }

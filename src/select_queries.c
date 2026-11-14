@@ -1,6 +1,6 @@
 #include "database_engine.h"
 
-QueryResultCapture* g_result_capture = NULL;
+THREAD_LOCAL QueryResultCapture* g_result_capture = NULL;
 
 static void print_escaped_cell_to(FILE* out, const char* text) {
     for (; *text; text++) {
@@ -30,6 +30,7 @@ typedef enum {
     PROJ_JSON_EXTRACT,
     PROJ_ROW_NUMBER,
     PROJ_RANK,
+    PROJ_DENSE_RANK,
     PROJ_UPPER,
     PROJ_LOWER,
     PROJ_LENGTH,
@@ -43,6 +44,8 @@ typedef enum {
     PROJ_MOD,
     PROJ_COALESCE,
     PROJ_NVL,
+    PROJ_NVL2,
+    PROJ_IDENTITY,
     PROJ_CASE
 } ProjType;
 
@@ -69,6 +72,9 @@ typedef struct {
     Value expr_operand;
     char json_path[MAX_VAL_LEN];
     bool is_window;
+    ColumnName partition_name;
+    Binding partition_binding;
+    bool has_partition;
 
     int substr_start;
     int substr_len;
@@ -81,6 +87,11 @@ typedef struct {
     bool has_literal1;
     Value literal2;
     bool has_literal2;
+    Value literal3;
+    bool has_literal3;
+    ColumnName raw_name3;
+    Binding binding3;
+    bool has_binding3;
 
     CaseBranch case_branches[MAX_CASE_BRANCHES];
     int case_branch_count;
@@ -98,23 +109,32 @@ typedef struct {
     DataType type;
 } SortKey;
 
-static const SortKey* g_sort_keys = NULL;
-static int g_sort_key_count = 0;
-
-static int compare_row_data(const void* a_ptr, const void* b_ptr) {
-    const RowData* a = (const RowData*)a_ptr;
-    const RowData* b = (const RowData*)b_ptr;
-    for (int k = 0; k < g_sort_key_count; k++) {
-        int idx = g_sort_keys[k].proj_idx;
+static int compare_rows_with_keys(const RowData* a, const RowData* b, const SortKey* keys, int key_count) {
+    for (int k = 0; k < key_count; k++) {
+        int idx = keys[k].proj_idx;
         const Value* va = &a->cells[idx];
         const Value* vb = &b->cells[idx];
         if (va->is_null && vb->is_null) continue;
-        if (va->is_null) return g_sort_keys[k].desc ? -1 : 1;
-        if (vb->is_null) return g_sort_keys[k].desc ? 1 : -1;
-        int cmp = compare_typed_values(g_sort_keys[k].type, va, vb);
-        if (cmp != 0) return g_sort_keys[k].desc ? -cmp : cmp;
+        if (va->is_null) return keys[k].desc ? -1 : 1;
+        if (vb->is_null) return keys[k].desc ? 1 : -1;
+        int cmp = compare_typed_values(keys[k].type, va, vb);
+        if (cmp != 0) return keys[k].desc ? -cmp : cmp;
     }
     return 0;
+}
+
+static void sort_row_data(RowData* rows, int count, const SortKey* keys, int key_count) {
+    if (count <= 1 || key_count <= 0) return;
+    for (int gap = count / 2; gap > 0; gap /= 2) {
+        for (int i = gap; i < count; i++) {
+            RowData temp = rows[i];
+            int j;
+            for (j = i; j >= gap && compare_rows_with_keys(&rows[j - gap], &temp, keys, key_count) > 0; j -= gap) {
+                rows[j] = rows[j - gap];
+            }
+            rows[j] = temp;
+        }
+    }
 }
 
 typedef struct {
@@ -300,6 +320,25 @@ static void evaluate_scalar_item(const ProjItem* item, const Value* src, const V
         }
         break;
     }
+    case PROJ_NVL2: {
+        const Value* in1 = item->has_literal1 ? &item->literal1 : src;
+        const Value* in2 = item->has_binding2 ? src2 : &item->literal2;
+        const Value* in3 = &item->literal3;
+        if (in1 && !in1->is_null) {
+            if (in2 && !in2->is_null) *out = *in2;
+            else out->is_null = true;
+        } else {
+            if (in3 && !in3->is_null) *out = *in3;
+            else out->is_null = true;
+        }
+        break;
+    }
+    case PROJ_IDENTITY: {
+        const Value* in = item->has_literal1 ? &item->literal1 : src;
+        if (!in || in->is_null) { out->is_null = true; return; }
+        *out = *in;
+        break;
+    }
     default:
         out->is_null = true;
         break;
@@ -345,6 +384,7 @@ static void evaluate_case_item(const ProjItem* item, const Scope* scope, Value* 
 }
 
 typedef struct { int indices[MAX_SCOPE_TABLES]; } ResultTuple;
+static int g_select_max_needed = MAX_RESULTS;
 
 static void emit_tuples(
     const Scope* scope,
@@ -362,7 +402,12 @@ static void emit_tuples(
     bool* work_limit_reached,
     bool* right_matched)
 {
-    if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+    if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
 
     if (table_idx == scope->count) {
         Scope sc = *scope;
@@ -429,7 +474,7 @@ static void emit_tuples(
                 }
                 current_tuple[0] = r_idx;
                 emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-                if (*selected >= MAX_RESULTS || *work_limit_reached) break;
+                if (*selected >= g_select_max_needed || *work_limit_reached) break;
             }
             free(candidate_rows);
             return;
@@ -443,7 +488,12 @@ static void emit_tuples(
             }
             current_tuple[0] = r0;
             emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-            if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+            if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
         }
         if (scope->count > 1 && join_types[1] == JOIN_FULL && right_matched) {
             for (int r1 = 0; r1 < scope->tables[1]->row_count; r1++) {
@@ -451,7 +501,12 @@ static void emit_tuples(
                     current_tuple[0] = -1;
                     current_tuple[1] = r1;
                     emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, 2, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-                    if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+                    if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
                 }
             }
         }
@@ -463,7 +518,12 @@ static void emit_tuples(
             if (++(*pairs) > MAX_PAIRS) { *work_limit_reached = true; return; }
             current_tuple[table_idx] = b;
             emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, table_idx + 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-            if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+            if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
         }
         return;
     }
@@ -489,7 +549,12 @@ static void emit_tuples(
                         matched++;
                         if (table_idx == 1 && right_matched) right_matched[b] = true;
                         emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, table_idx + 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-                        if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+                        if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
                     }
                     e = join_indexes[table_idx].entries[e].next;
                 }
@@ -504,7 +569,12 @@ static void emit_tuples(
                 matched++;
                 if (table_idx == 1 && right_matched) right_matched[b] = true;
                 emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, table_idx + 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
-                if (*selected >= MAX_RESULTS || *work_limit_reached) return;
+                if (*selected >= g_select_max_needed || *work_limit_reached) return;
+    if (is_query_timed_out()) {
+        *work_limit_reached = true;
+        report_database_error("query canceled due to statement timeout (%u ms)", g_statement_timeout_ms);
+        return;
+    }
             }
         }
     }
@@ -513,6 +583,29 @@ static void emit_tuples(
         current_tuple[table_idx] = -1;
         emit_tuples(scope, joins, join_types, use_hash, join_indexes, left_cols, filter, table_idx + 1, current_tuple, results, selected, pairs, work_limit_reached, right_matched);
     }
+}
+
+static bool check_query_pager(int printed, int total_remaining, int* lines_since_prompt) {
+    if (!g_interactive_shell || !g_pager_enabled) return false;
+    if (total_remaining <= 25) return false;
+    if (printed <= 0) return false;
+    if (*lines_since_prompt < 25) return false;
+
+    printf("-- More (%d remaining) [Enter: 1 row, Space: page, q: quit] --", total_remaining);
+    fflush(stdout);
+    int pk = shell_read_key();
+    printf("\r                                                                               \r");
+    fflush(stdout);
+    if (pk == 'q' || pk == 'Q' || pk == SHELL_KEY_CTRL_C) {
+        printf("\n[Paging stopped by user]\n");
+        return true;
+    }
+    if (pk == SHELL_KEY_ENTER || pk == '\n') {
+        *lines_since_prompt = 24;
+    } else {
+        *lines_since_prompt = 0;
+    }
+    return false;
 }
 
 static void render_capture_to_output(const QueryResultCapture* cap, int limit, int offset) {
@@ -577,6 +670,100 @@ static void render_capture_to_output(const QueryResultCapture* cap, int limit, i
             else puts("}");
         }
         puts("]");
+    } else if (g_output_format == FORMAT_BOX || (g_interactive_shell && g_output_format == FORMAT_TABLE)) {
+        int widths[MAX_COLUMNS];
+        for (int c = 0; c < cap->col_count; c++) {
+            widths[c] = (int)strlen(cap->col_names[c]);
+        }
+        int printed = 0;
+        for (int r = offset; r < total_rows && printed < limit; r++) {
+            for (int c = 0; c < cap->col_count; c++) {
+                int len = cap->rows[r][c].is_null ? (int)strlen(g_null_str) : (int)strlen(cap->rows[r][c].text);
+                if (len > widths[c]) widths[c] = len;
+            }
+            printed++;
+        }
+        fputs("+", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            for (int i = 0; i < widths[c] + 2; i++) fputc('-', stdout);
+            fputc('+', stdout);
+        }
+        fputc('\n', stdout);
+        fputs("|", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            printf(" %-*s |", widths[c], cap->col_names[c]);
+        }
+        fputc('\n', stdout);
+        fputs("+", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            for (int i = 0; i < widths[c] + 2; i++) fputc('-', stdout);
+            fputc('+', stdout);
+        }
+        fputc('\n', stdout);
+        printed = 0;
+        int lines_since_prompt = 0;
+        for (int r = offset; r < total_rows && printed < limit; r++) {
+            if (check_query_pager(printed, total_rows - r, &lines_since_prompt)) break;
+            fputs("|", stdout);
+            for (int c = 0; c < cap->col_count; c++) {
+                const char* txt = cap->rows[r][c].is_null ? g_null_str : cap->rows[r][c].text;
+                printf(" %-*s |", widths[c], txt);
+            }
+            fputc('\n', stdout);
+            printed++;
+            lines_since_prompt++;
+        }
+        fputs("+", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            for (int i = 0; i < widths[c] + 2; i++) fputc('-', stdout);
+            fputc('+', stdout);
+        }
+        fputc('\n', stdout);
+        printf("\n%d row%s selected.\n", printed, printed == 1 ? "" : "s");
+    } else if (g_output_format == FORMAT_MARKDOWN) {
+        fputs("|", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            printf(" %s |", cap->col_names[c]);
+        }
+        fputc('\n', stdout);
+        fputs("|", stdout);
+        for (int c = 0; c < cap->col_count; c++) {
+            fputs(" --- |", stdout);
+        }
+        fputc('\n', stdout);
+        int printed = 0;
+        int lines_since_prompt = 0;
+        for (int r = offset; r < total_rows && printed < limit; r++) {
+            if (check_query_pager(printed, total_rows - r, &lines_since_prompt)) break;
+            fputs("|", stdout);
+            for (int c = 0; c < cap->col_count; c++) {
+                const char* txt = cap->rows[r][c].is_null ? g_null_str : cap->rows[r][c].text;
+                printf(" %s |", txt);
+            }
+            fputc('\n', stdout);
+            printed++;
+            lines_since_prompt++;
+        }
+        printf("\n%d row%s selected.\n", printed, printed == 1 ? "" : "s");
+    } else if (g_output_format == FORMAT_VERTICAL) {
+        int max_name_len = 0;
+        for (int c = 0; c < cap->col_count; c++) {
+            int len = (int)strlen(cap->col_names[c]);
+            if (len > max_name_len) max_name_len = len;
+        }
+        int printed = 0;
+        int lines_since_prompt = 0;
+        for (int r = offset; r < total_rows && printed < limit; r++) {
+            if (check_query_pager(printed, total_rows - r, &lines_since_prompt)) break;
+            printf("*************************** %d. row ***************************\n", printed + 1);
+            for (int c = 0; c < cap->col_count; c++) {
+                const char* txt = cap->rows[r][c].is_null ? g_null_str : cap->rows[r][c].text;
+                printf("%*s: %s\n", max_name_len, cap->col_names[c], txt);
+            }
+            printed++;
+            lines_since_prompt++;
+        }
+        printf("\n%d row%s selected.\n", printed, printed == 1 ? "" : "s");
     } else {
         for (int c = 0; c < cap->col_count; c++) {
             if (c > 0) {
@@ -732,6 +919,25 @@ static bool combine_captures(QueryResultCapture* cap_a, const QueryResultCapture
     return true;
 }
 
+static bool parse_window_over_clause(Parser* p, ProjItem* item) {
+    if (consume_keyword(p, "OVER")) {
+        if (!consume_token(p, TK_LP)) return false;
+        if (consume_keyword(p, "PARTITION")) {
+            consume_keyword(p, "BY");
+            if (!parse_column_reference(p, &item->partition_name)) return false;
+            item->has_partition = true;
+        }
+        if (consume_keyword(p, "ORDER")) {
+            consume_keyword(p, "BY");
+            if (!parse_column_reference(p, &item->raw_name)) return false;
+            if (consume_keyword(p, "DESC")) item->expr_op = 'D';
+            else consume_keyword(p, "ASC");
+        }
+        if (!consume_token(p, TK_RP)) return false;
+    }
+    return true;
+}
+
 static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_capture, int* out_limit, int* out_offset) {
     bool ok = false;
     ProjItem* proj_items = calloc(MAX_COLUMNS, sizeof(*proj_items));
@@ -752,6 +958,17 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
     }
 
     bool distinct = consume_keyword(p, "DISTINCT");
+    int top_n = -1;
+    if (consume_keyword(p, "TOP")) {
+        bool has_parens = consume_token(p, TK_LP);
+        if (p->kind != TK_NUMBER) goto cleanup;
+        errno = 0;
+        long tval = strtol(p->text, NULL, 10);
+        if (errno || tval < 0) goto cleanup;
+        top_n = (int)tval;
+        scan_next_token(p);
+        if (has_parens && !consume_token(p, TK_RP)) goto cleanup;
+    }
     int proj_count = 0;
     bool star = consume_token(p, TK_STAR);
     bool has_agg = false;
@@ -783,7 +1000,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             } else if (consume_keyword(p, "MAX")) {
                 has_agg = true; item->type = PROJ_MAX;
                 if (!consume_token(p, TK_LP) || !parse_column_reference(p, &item->raw_name) || !consume_token(p, TK_RP)) goto cleanup;
-            } else if (consume_keyword(p, "JSON_EXTRACT")) {
+            } else if (consume_keyword(p, "JSON_EXTRACT") || consume_keyword(p, "JSON_VALUE")) {
                 item->type = PROJ_JSON_EXTRACT;
                 if (!consume_token(p, TK_LP) || !parse_column_reference(p, &item->raw_name) || !consume_token(p, TK_COMMA)) goto cleanup;
                 if (p->kind != TK_STRING) goto cleanup;
@@ -795,33 +1012,76 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 item->is_window = true;
                 item->data_type = TYPE_NUMBER;
                 if (!consume_token(p, TK_LP) || !consume_token(p, TK_RP)) goto cleanup;
-                if (consume_keyword(p, "OVER")) {
-                    if (!consume_token(p, TK_LP)) goto cleanup;
-                    if (consume_keyword(p, "ORDER")) {
-                        consume_keyword(p, "BY");
-                        parse_column_reference(p, &item->raw_name);
-                        if (consume_keyword(p, "DESC")) item->expr_op = 'D';
-                        else consume_keyword(p, "ASC");
-                    }
-                    if (!consume_token(p, TK_RP)) goto cleanup;
-                }
+                if (!parse_window_over_clause(p, item)) goto cleanup;
                 snprintf(item->display_name, sizeof(item->display_name), "ROW_NUMBER()");
             } else if (consume_keyword(p, "RANK")) {
                 item->type = PROJ_RANK;
                 item->is_window = true;
                 item->data_type = TYPE_NUMBER;
                 if (!consume_token(p, TK_LP) || !consume_token(p, TK_RP)) goto cleanup;
-                if (consume_keyword(p, "OVER")) {
-                    if (!consume_token(p, TK_LP)) goto cleanup;
-                    if (consume_keyword(p, "ORDER")) {
-                        consume_keyword(p, "BY");
-                        parse_column_reference(p, &item->raw_name);
-                        if (consume_keyword(p, "DESC")) item->expr_op = 'D';
-                        else consume_keyword(p, "ASC");
-                    }
-                    if (!consume_token(p, TK_RP)) goto cleanup;
-                }
+                if (!parse_window_over_clause(p, item)) goto cleanup;
                 snprintf(item->display_name, sizeof(item->display_name), "RANK()");
+            } else if (consume_keyword(p, "DENSE_RANK")) {
+                item->type = PROJ_DENSE_RANK;
+                item->is_window = true;
+                item->data_type = TYPE_NUMBER;
+                if (!consume_token(p, TK_LP) || !consume_token(p, TK_RP)) goto cleanup;
+                if (!parse_window_over_clause(p, item)) goto cleanup;
+                snprintf(item->display_name, sizeof(item->display_name), "DENSE_RANK()");
+            } else if (consume_keyword(p, "ROWNUM")) {
+                item->type = PROJ_ROW_NUMBER;
+                item->is_window = true;
+                item->data_type = TYPE_NUMBER;
+                snprintf(item->display_name, sizeof(item->display_name), "ROWNUM");
+            } else if (consume_keyword(p, "GETDATE") || consume_keyword(p, "NOW")) {
+                item->type = PROJ_IDENTITY;
+                if (consume_token(p, TK_LP)) consume_token(p, TK_RP);
+                time_t now = time(NULL); struct tm tm_val;
+#ifdef _WIN32
+                localtime_s(&tm_val, &now);
+#else
+                localtime_r(&now, &tm_val);
+#endif
+                strftime(item->literal1.text, sizeof(item->literal1.text), "%Y-%m-%d %H:%M:%S", &tm_val);
+                item->literal1.is_null = false;
+                item->has_literal1 = true;
+                item->data_type = TYPE_DATE;
+                snprintf(item->display_name, sizeof(item->display_name), "GETDATE()");
+            } else if (consume_keyword(p, "CAST")) {
+                item->type = PROJ_IDENTITY;
+                if (!consume_token(p, TK_LP)) goto cleanup;
+                if (p->kind == TK_STRING || p->kind == TK_NUMBER) {
+                    snprintf(item->literal1.text, sizeof(item->literal1.text), "%s", p->text);
+                    item->literal1.is_null = false;
+                    item->has_literal1 = true;
+                    scan_next_token(p);
+                } else {
+                    if (!parse_column_reference(p, &item->raw_name)) goto cleanup;
+                }
+                if (!consume_keyword(p, "AS")) goto cleanup;
+                if (p->kind == TK_ID) scan_next_token(p);
+                if (consume_token(p, TK_LP)) {
+                    while (p->kind != TK_RP && p->kind != TK_END) scan_next_token(p);
+                    consume_token(p, TK_RP);
+                }
+                if (!consume_token(p, TK_RP)) goto cleanup;
+                snprintf(item->display_name, sizeof(item->display_name), "CAST");
+            } else if (consume_keyword(p, "TO_CHAR") || consume_keyword(p, "TO_NUMBER") || consume_keyword(p, "TO_DATE")) {
+                item->type = PROJ_IDENTITY;
+                if (!consume_token(p, TK_LP)) goto cleanup;
+                if (p->kind == TK_STRING || p->kind == TK_NUMBER) {
+                    snprintf(item->literal1.text, sizeof(item->literal1.text), "%s", p->text);
+                    item->literal1.is_null = false;
+                    item->has_literal1 = true;
+                    scan_next_token(p);
+                } else {
+                    if (!parse_column_reference(p, &item->raw_name)) goto cleanup;
+                }
+                if (consume_token(p, TK_COMMA)) {
+                    if (p->kind == TK_STRING) scan_next_token(p);
+                }
+                if (!consume_token(p, TK_RP)) goto cleanup;
+                snprintf(item->display_name, sizeof(item->display_name), "CONVERT");
             } else if (consume_keyword(p, "UPPER")) {
                 item->type = PROJ_UPPER;
                 if (!consume_token(p, TK_LP)) goto cleanup;
@@ -986,7 +1246,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 item->mod_divisor = strtold(p->text, NULL);
                 scan_next_token(p);
                 if (!consume_token(p, TK_RP)) goto cleanup;
-            } else if (consume_keyword(p, "COALESCE") || consume_keyword(p, "NVL")) {
+            } else if (consume_keyword(p, "COALESCE") || consume_keyword(p, "NVL") || consume_keyword(p, "ISNULL")) {
                 item->type = PROJ_COALESCE;
                 if (!consume_token(p, TK_LP)) goto cleanup;
                 if (consume_keyword(p, "NULL")) {
@@ -1012,6 +1272,30 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 } else {
                     if (!parse_column_reference(p, &item->raw_name2)) goto cleanup;
                     item->has_binding2 = true;
+                }
+                if (!consume_token(p, TK_RP)) goto cleanup;
+            } else if (consume_keyword(p, "NVL2")) {
+                item->type = PROJ_NVL2;
+                if (!consume_token(p, TK_LP)) goto cleanup;
+                if (!parse_column_reference(p, &item->raw_name)) goto cleanup;
+                if (!consume_token(p, TK_COMMA)) goto cleanup;
+                if (p->kind == TK_STRING || p->kind == TK_NUMBER) {
+                    snprintf(item->literal2.text, sizeof(item->literal2.text), "%s", p->text);
+                    item->literal2.is_null = false;
+                    item->has_literal2 = true;
+                    scan_next_token(p);
+                } else {
+                    if (!parse_column_reference(p, &item->raw_name2)) goto cleanup;
+                    item->has_binding2 = true;
+                }
+                if (!consume_token(p, TK_COMMA)) goto cleanup;
+                if (p->kind == TK_STRING || p->kind == TK_NUMBER) {
+                    snprintf(item->literal3.text, sizeof(item->literal3.text), "%s", p->text);
+                    item->literal3.is_null = false;
+                    item->has_literal3 = true;
+                    scan_next_token(p);
+                } else {
+                    goto cleanup;
                 }
                 if (!consume_token(p, TK_RP)) goto cleanup;
             } else if (consume_keyword(p, "CASE")) {
@@ -1083,10 +1367,51 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 item->expr_operand.is_null = false;
                 scan_next_token(p);
                 if (!consume_token(p, TK_RP)) goto cleanup;
+            } else if (p->kind == TK_NUMBER || p->kind == TK_STRING) {
+                item->type = PROJ_COL;
+                item->has_literal1 = true;
+                item->literal1.is_null = false;
+                snprintf(item->literal1.text, sizeof(item->literal1.text), "%s", p->text);
+                snprintf(item->display_name, sizeof(item->display_name), "%s", p->text);
+                scan_next_token(p);
+                if (p->kind == TK_STAR || p->kind == TK_PLUS || p->kind == TK_MINUS || p->kind == TK_SLASH) {
+                    item->expr_op = (p->kind == TK_PLUS ? '+' : p->kind == TK_MINUS ? '-' : p->kind == TK_STAR ? '*' : '/');
+                    char op_ch = item->expr_op;
+                    scan_next_token(p);
+                    if (p->kind == TK_NUMBER) {
+                        item->has_literal2 = true;
+                        item->literal2.is_null = false;
+                        normalize_decimal(p->text, item->literal2.text);
+                        double n1 = strtod(item->literal1.text, NULL);
+                        double n2 = strtod(p->text, NULL);
+                        double res = 0.0;
+                        if (op_ch == '+') res = n1 + n2;
+                        else if (op_ch == '-') res = n1 - n2;
+                        else if (op_ch == '*') res = n1 * n2;
+                        else if (op_ch == '/') res = (n2 != 0.0) ? (n1 / n2) : 0.0;
+                        if (res == (double)(int64_t)res) {
+                            snprintf(item->literal1.text, sizeof(item->literal1.text), "%lld", (long long)res);
+                        } else {
+                            snprintf(item->literal1.text, sizeof(item->literal1.text), "%.6g", res);
+                        }
+                        char combined_name[MAX_NAME_LEN];
+                        snprintf(combined_name, sizeof(combined_name), "%s %c %s", item->display_name, op_ch, p->text);
+                        snprintf(item->display_name, sizeof(item->display_name), "%s", combined_name);
+                        scan_next_token(p);
+                    } else { goto cleanup; }
+                }
             } else {
                 item->type = PROJ_COL;
                 if (!parse_column_reference(p, &item->raw_name)) goto cleanup;
-                if (p->kind == TK_COSINE_DIST || p->kind == TK_L2_DIST) {
+                if (p->kind == TK_JSON_ARROW || p->kind == TK_JSON_TEXT_ARROW) {
+                    item->type = PROJ_JSON_EXTRACT;
+                    item->expr_op = (p->kind == TK_JSON_TEXT_ARROW) ? '>' : '-';
+                    scan_next_token(p);
+                    if (p->kind == TK_STRING || p->kind == TK_NUMBER) {
+                        snprintf(item->json_path, sizeof(item->json_path), "%s", p->text);
+                        scan_next_token(p);
+                    } else goto cleanup;
+                } else if (p->kind == TK_COSINE_DIST || p->kind == TK_L2_DIST) {
                     item->expr_op = (p->kind == TK_COSINE_DIST) ? 'C' : 'L';
                     scan_next_token(p);
                     if (p->kind != TK_STRING) goto cleanup;
@@ -1108,6 +1433,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             } else if (p->kind == TK_ID && !token_is_keyword(p, "FROM") && !token_is_keyword(p, "WHERE") &&
                        !token_is_keyword(p, "GROUP") && !token_is_keyword(p, "HAVING") &&
                        !token_is_keyword(p, "ORDER") && !token_is_keyword(p, "LIMIT") &&
+                       !token_is_keyword(p, "FOR") &&
                        !token_is_keyword(p, "UNION") && !token_is_keyword(p, "INTERSECT") &&
                        !token_is_keyword(p, "MINUS") && !token_is_keyword(p, "EXCEPT")) {
                 if (!parse_identifier(p, item->alias)) goto cleanup;
@@ -1115,20 +1441,38 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
         } while (consume_token(p, TK_COMMA));
     }
 
-    if (!consume_keyword(p, "FROM")) goto cleanup;
-    char table_name[MAX_NAME_LEN];
-    if (!parse_identifier(p, table_name)) goto cleanup;
+    char table_name[MAX_NAME_LEN] = {0};
     char table_alias[MAX_NAME_LEN] = {0};
-    if (consume_keyword(p, "AS")) {
-        if (!parse_identifier(p, table_alias)) goto cleanup;
-    } else if (p->kind == TK_ID && !token_is_keyword(p, "WHERE") && !token_is_keyword(p, "LEFT") &&
-               !token_is_keyword(p, "FULL") && !token_is_keyword(p, "CROSS") &&
-               !token_is_keyword(p, "INNER") && !token_is_keyword(p, "JOIN") && !token_is_keyword(p, "GROUP") &&
-               !token_is_keyword(p, "HAVING") && !token_is_keyword(p, "ORDER") &&
-               !token_is_keyword(p, "LIMIT") && !token_is_keyword(p, "OFFSET") &&
-               !token_is_keyword(p, "UNION") && !token_is_keyword(p, "INTERSECT") &&
-               !token_is_keyword(p, "MINUS") && !token_is_keyword(p, "EXCEPT")) {
-        if (!parse_identifier(p, table_alias)) goto cleanup;
+    bool has_from = consume_keyword(p, "FROM");
+    if (!has_from) {
+        snprintf(table_name, sizeof(table_name), "DUAL");
+    } else {
+        if (!parse_identifier(p, table_name)) goto cleanup;
+        if (consume_token(p, TK_DOT)) {
+            char subname[MAX_NAME_LEN];
+            if (!parse_identifier(p, subname)) goto cleanup;
+            int tidx = find_table_index(g_db, subname);
+            if (tidx >= 0) snprintf(table_name, sizeof(table_name), "%s", subname);
+            else {
+                char fq[MAX_NAME_LEN];
+                snprintf(fq, sizeof(fq), "%s.%s", table_name, subname);
+                tidx = find_table_index(g_db, fq);
+                if (tidx >= 0) snprintf(table_name, sizeof(table_name), "%s", fq);
+                else snprintf(table_name, sizeof(table_name), "%s", subname);
+            }
+        }
+        if (consume_keyword(p, "AS")) {
+            if (!parse_identifier(p, table_alias)) goto cleanup;
+        } else if (p->kind == TK_ID && !token_is_keyword(p, "WHERE") && !token_is_keyword(p, "LEFT") &&
+                   !token_is_keyword(p, "FULL") && !token_is_keyword(p, "CROSS") &&
+                   !token_is_keyword(p, "INNER") && !token_is_keyword(p, "JOIN") && !token_is_keyword(p, "GROUP") &&
+                   !token_is_keyword(p, "HAVING") && !token_is_keyword(p, "ORDER") &&
+                   !token_is_keyword(p, "LIMIT") && !token_is_keyword(p, "OFFSET") &&
+                   !token_is_keyword(p, "FOR") &&
+                   !token_is_keyword(p, "UNION") && !token_is_keyword(p, "INTERSECT") &&
+                   !token_is_keyword(p, "MINUS") && !token_is_keyword(p, "EXCEPT")) {
+            if (!parse_identifier(p, table_alias)) goto cleanup;
+        }
     }
 
     if (!strcmp(table_name, "DUAL")) {
@@ -1137,6 +1481,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             out_capture->col_count = 1;
             snprintf(out_capture->col_names[0], MAX_NAME_LEN, "%s", header ? header : "COUNT(*)");
             out_capture->rows = malloc(sizeof(*out_capture->rows));
+            if (!out_capture->rows) { report_database_error("out of memory"); goto cleanup; }
             out_capture->capacity = 1;
             out_capture->row_count = 1;
             snprintf(out_capture->rows[0][0].text, MAX_VAL_LEN, "1");
@@ -1148,6 +1493,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             out_capture->col_count = 1;
             snprintf(out_capture->col_names[0], MAX_NAME_LEN, "%s", header ? header : "DUMMY");
             out_capture->rows = malloc(sizeof(*out_capture->rows));
+            if (!out_capture->rows) { report_database_error("out of memory"); goto cleanup; }
             out_capture->capacity = 1;
             out_capture->row_count = 1;
             snprintf(out_capture->rows[0][0].text, MAX_VAL_LEN, "X");
@@ -1158,6 +1504,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             out_capture->col_count = 1;
             snprintf(out_capture->col_names[0], MAX_NAME_LEN, "%s", header ? header : "USER");
             out_capture->rows = malloc(sizeof(*out_capture->rows));
+            if (!out_capture->rows) { report_database_error("out of memory"); goto cleanup; }
             out_capture->capacity = 1;
             out_capture->row_count = 1;
             snprintf(out_capture->rows[0][0].text, MAX_VAL_LEN, "SYSDBA");
@@ -1176,6 +1523,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
             out_capture->col_count = 1;
             snprintf(out_capture->col_names[0], MAX_NAME_LEN, "%s", header ? header : "SYSDATE");
             out_capture->rows = malloc(sizeof(*out_capture->rows));
+            if (!out_capture->rows) { report_database_error("out of memory"); goto cleanup; }
             out_capture->capacity = 1;
             out_capture->row_count = 1;
             snprintf(out_capture->rows[0][0].text, MAX_VAL_LEN, "%s", date);
@@ -1185,6 +1533,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
 
         out_capture->col_count = proj_count;
         out_capture->rows = malloc((size_t)(proj_count > 0 ? proj_count : 1) * sizeof(*out_capture->rows));
+        if (!out_capture->rows) { report_database_error("out of memory"); goto cleanup; }
         out_capture->capacity = 1;
         out_capture->row_count = 1;
         for (int c = 0; c < proj_count; c++) {
@@ -1192,7 +1541,9 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                      proj_items[c].alias[0] ? proj_items[c].alias :
                      (proj_items[c].display_name[0] ? proj_items[c].display_name : proj_items[c].raw_name.column));
             Value dummy_null = { .is_null = true, .text = "" };
-            if (proj_items[c].type >= PROJ_UPPER && proj_items[c].type <= PROJ_NVL) {
+            if (proj_items[c].has_literal1) {
+                out_capture->rows[0][c] = proj_items[c].literal1;
+            } else if (proj_items[c].type >= PROJ_UPPER && proj_items[c].type <= PROJ_IDENTITY) {
                 evaluate_scalar_item(&proj_items[c], &dummy_null, &dummy_null, &out_capture->rows[0][c]);
             } else {
                 out_capture->rows[0][c] = dummy_null;
@@ -1297,13 +1648,54 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
     } else {
         for (int i = 0; i < proj_count; i++) {
             ProjItem* item = &proj_items[i];
-            if (item->type == PROJ_ROW_NUMBER || item->type == PROJ_RANK) {
+            if (item->type == PROJ_ROW_NUMBER || item->type == PROJ_RANK || item->type == PROJ_DENSE_RANK) {
                 item->data_type = TYPE_NUMBER;
+                if (item->has_partition && item->partition_name.column[0]) {
+                    if (!resolve_column_reference(&scope, &item->partition_name, &item->partition_binding)) goto cleanup;
+                    if (item->partition_binding.table & 0x1000) {
+                        report_database_error("outer-scope column is not allowed in PARTITION BY");
+                        goto cleanup;
+                    }
+                    bool found_p = false;
+                    for (int c = 0; c < proj_count; c++) {
+                        if (proj_items[c].type == PROJ_COL &&
+                            proj_items[c].binding.table == item->partition_binding.table &&
+                            proj_items[c].binding.column == item->partition_binding.column) {
+                            found_p = true; break;
+                        }
+                    }
+                    if (!found_p && proj_count < MAX_COLUMNS) {
+                        int h = proj_count++;
+                        memset(&proj_items[h], 0, sizeof(ProjItem));
+                        proj_items[h].type = PROJ_COL;
+                        proj_items[h].binding = item->partition_binding;
+                        proj_items[h].raw_name = item->partition_name;
+                        proj_items[h].data_type = scope.tables[item->partition_binding.table]->columns[item->partition_binding.column].type;
+                        proj_items[h].is_hidden = true;
+                    }
+                }
                 if (item->raw_name.column[0]) {
-                    resolve_column_reference(&scope, &item->raw_name, &item->binding);
+                    if (!resolve_column_reference(&scope, &item->raw_name, &item->binding)) goto cleanup;
                     if (item->binding.table & 0x1000) {
                         report_database_error("outer-scope column is not allowed in a window function");
                         goto cleanup;
+                    }
+                    bool found_o = false;
+                    for (int c = 0; c < proj_count; c++) {
+                        if (proj_items[c].type == PROJ_COL &&
+                            proj_items[c].binding.table == item->binding.table &&
+                            proj_items[c].binding.column == item->binding.column) {
+                            found_o = true; break;
+                        }
+                    }
+                    if (!found_o && proj_count < MAX_COLUMNS) {
+                        int h = proj_count++;
+                        memset(&proj_items[h], 0, sizeof(ProjItem));
+                        proj_items[h].type = PROJ_COL;
+                        proj_items[h].binding = item->binding;
+                        proj_items[h].raw_name = item->raw_name;
+                        proj_items[h].data_type = scope.tables[item->binding.table]->columns[item->binding.column].type;
+                        proj_items[h].is_hidden = true;
                     }
                 }
             } else if (item->type == PROJ_CASE) {
@@ -1311,7 +1703,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 for (int b = 0; b < item->case_branch_count; b++) {
                     resolve_column_reference(&scope, &item->case_branches[b].raw_name, &item->case_branches[b].binding);
                 }
-            } else if (item->type >= PROJ_UPPER && item->type <= PROJ_NVL) {
+            } else if (item->type >= PROJ_UPPER && item->type <= PROJ_IDENTITY) {
                 if (!item->has_literal1 && item->raw_name.column[0]) {
                     if (!resolve_column_reference(&scope, &item->raw_name, &item->binding)) goto cleanup;
                     if (item->binding.table & 0x1000) {
@@ -1360,9 +1752,18 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 case PROJ_AVG: snprintf(item->display_name, sizeof(item->display_name), "AVG(%s)", cname); break;
                 case PROJ_MIN: snprintf(item->display_name, sizeof(item->display_name), "MIN(%s)", cname); break;
                 case PROJ_MAX: snprintf(item->display_name, sizeof(item->display_name), "MAX(%s)", cname); break;
-                case PROJ_JSON_EXTRACT: snprintf(item->display_name, sizeof(item->display_name), "JSON_EXTRACT(%s, '%s')", cname, item->json_path); break;
+                case PROJ_JSON_EXTRACT:
+                    if (item->expr_op == '>') {
+                        snprintf(item->display_name, sizeof(item->display_name), "%s->>'%s'", cname, item->json_path);
+                    } else if (item->expr_op == '-') {
+                        snprintf(item->display_name, sizeof(item->display_name), "%s->'%s'", cname, item->json_path);
+                    } else {
+                        snprintf(item->display_name, sizeof(item->display_name), "JSON_EXTRACT(%s, '%s')", cname, item->json_path);
+                    }
+                    break;
                 case PROJ_ROW_NUMBER: snprintf(item->display_name, sizeof(item->display_name), "ROW_NUMBER()"); break;
                 case PROJ_RANK: snprintf(item->display_name, sizeof(item->display_name), "RANK()"); break;
+                case PROJ_DENSE_RANK: snprintf(item->display_name, sizeof(item->display_name), "DENSE_RANK()"); break;
                 case PROJ_UPPER: snprintf(item->display_name, sizeof(item->display_name), "UPPER(%s)", cname); break;
                 case PROJ_LOWER: snprintf(item->display_name, sizeof(item->display_name), "LOWER(%s)", cname); break;
                 case PROJ_LENGTH: snprintf(item->display_name, sizeof(item->display_name), "LENGTH(%s)", cname); break;
@@ -1376,6 +1777,10 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 case PROJ_MOD: snprintf(item->display_name, sizeof(item->display_name), "MOD(%s)", cname); break;
                 case PROJ_COALESCE:
                 case PROJ_NVL: snprintf(item->display_name, sizeof(item->display_name), "COALESCE(%s)", cname); break;
+                case PROJ_NVL2: snprintf(item->display_name, sizeof(item->display_name), "NVL2(%s)", cname); break;
+                case PROJ_IDENTITY:
+                    if (!item->display_name[0]) snprintf(item->display_name, sizeof(item->display_name), "%s", cname);
+                    break;
                 case PROJ_CASE: snprintf(item->display_name, sizeof(item->display_name), "CASE"); break;
                 default:
                     if (item->expr_op == 'C') {
@@ -1389,6 +1794,27 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                     else
                         snprintf(item->display_name, sizeof(item->display_name), "%s", cname);
                     break;
+                }
+            }
+        }
+    }
+
+    if (token_is_keyword(p, "WHERE")) {
+        Parser lookahead = *p;
+        scan_next_token(&lookahead);
+        if (token_is_keyword(&lookahead, "ROWNUM")) {
+            scan_next_token(&lookahead);
+            if (lookahead.kind == TK_LE || lookahead.kind == TK_LT || lookahead.kind == TK_EQ) {
+                TokenKind r_op = lookahead.kind;
+                scan_next_token(&lookahead);
+                if (lookahead.kind == TK_NUMBER) {
+                    errno = 0;
+                    long r_val = strtol(lookahead.text, NULL, 10);
+                    if (!errno && r_val >= 0) {
+                        int r_limit = (r_op == TK_LT) ? (int)(r_val - 1) : (int)r_val;
+                        if (r_limit < 0) r_limit = 0;
+                        if (top_n < 0 || r_limit < top_n) top_n = r_limit;
+                    }
                 }
             }
         }
@@ -1595,7 +2021,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
         } while (consume_token(p, TK_COMMA));
     }
 
-    int limit = (g_max_rows > 0 && g_max_rows < MAX_RESULTS) ? g_max_rows : MAX_RESULTS;
+    int limit = (top_n >= 0 && top_n < MAX_RESULTS) ? top_n : ((g_max_rows > 0 && g_max_rows < MAX_RESULTS) ? g_max_rows : MAX_RESULTS);
     int offset = 0;
     for (int iter = 0; iter < 2; iter++) {
         if (consume_keyword(p, "LIMIT")) {
@@ -1631,8 +2057,24 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
         }
     }
 
+    bool for_update = false;
+    bool skip_locked = false;
+    if (consume_keyword(p, "FOR")) {
+        if (consume_keyword(p, "UPDATE")) {
+            for_update = true;
+            if (consume_keyword(p, "SKIP")) {
+                if (consume_keyword(p, "LOCKED")) {
+                    skip_locked = true;
+                }
+            } else if (consume_keyword(p, "NOWAIT")) {
+                /* standard non-blocking modifier */
+            }
+        }
+    }
+
     *out_limit = limit;
     *out_offset = offset;
+    g_select_max_needed = (sort_count == 0 && (limit + offset) < MAX_RESULTS) ? (limit + offset) : MAX_RESULTS;
 
     results = malloc(MAX_RESULTS * sizeof(*results));
     if (!results) {
@@ -1857,6 +2299,28 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
         }
     } else {
         for (int r = 0; r < selected; r++) {
+            if (for_update && scope.count > 0 && scope.tables[0]) {
+                uint32_t rid = (uint32_t)(results[r].indices[0] + 1);
+                const char* tname = scope.tables[0]->name;
+                int sess = g_current_session_id > 0 ? g_current_session_id : 1;
+                if (skip_locked) {
+                    if (lock_manager_has_row_conflict(sess, tname, rid, LOCK_MODE_EXCLUSIVE)) {
+                        continue;
+                    }
+                }
+                if (!lock_manager_acquire_row(sess, tname, rid, LOCK_MODE_EXCLUSIVE, 2000)) {
+                    if (g_last_error[0] != '\0') {
+                        report_database_error("%s", g_last_error);
+                    } else {
+                        report_database_error("could not obtain lock on row in table '%s'", tname);
+                    }
+                    for (int prev_r = 0; prev_r < r; prev_r++) {
+                        uint32_t prev_rid = (uint32_t)(results[prev_r].indices[0] + 1);
+                        lock_manager_release_row(sess, tname, prev_rid);
+                    }
+                    goto cleanup;
+                }
+            }
             for (int t = 0; t < scope.count; t++) {
                 scope.rows[t] = results[r].indices[t] >= 0 ? &scope.tables[t]->rows[results[r].indices[t]] : NULL;
             }
@@ -1872,10 +2336,12 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                         &scope.rows[t2]->values[proj_items[i].binding2.column] : &null_val;
                 }
 
-                if (proj_items[i].type == PROJ_ROW_NUMBER || proj_items[i].type == PROJ_RANK) {
+                if (proj_items[i].type == PROJ_ROW_NUMBER || proj_items[i].type == PROJ_RANK || proj_items[i].type == PROJ_DENSE_RANK) {
                     /* Placeholder; real values are assigned after final sorting. */
                     snprintf(row->cells[i].text, sizeof(row->cells[i].text), "%d", total_output_rows);
                     row->cells[i].is_null = false;
+                } else if (proj_items[i].has_literal1 && !proj_items[i].raw_name.column[0]) {
+                    row->cells[i] = proj_items[i].literal1;
                 } else if (proj_items[i].type == PROJ_JSON_EXTRACT) {
                     if (src->is_null) {
                         row->cells[i] = null_val;
@@ -1885,7 +2351,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                     }
                 } else if (proj_items[i].type == PROJ_CASE) {
                     evaluate_case_item(&proj_items[i], &scope, &row->cells[i]);
-                } else if (proj_items[i].type >= PROJ_UPPER && proj_items[i].type <= PROJ_NVL) {
+                } else if (proj_items[i].type >= PROJ_UPPER && proj_items[i].type <= PROJ_IDENTITY) {
                     evaluate_scalar_item(&proj_items[i], src, src2, &row->cells[i]);
                 } else if (proj_items[i].expr_op != 0 && !src->is_null && !proj_items[i].expr_operand.is_null) {
                     long double res = 0;
@@ -1945,21 +2411,76 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
         total_output_rows = write_idx;
     }
 
+    /* If no explicit ORDER BY was specified, check if any window function requires sorting */
+    if (sort_count == 0 && total_output_rows > 1) {
+        for (int i = 0; i < proj_count; i++) {
+            if (proj_items[i].type == PROJ_ROW_NUMBER || proj_items[i].type == PROJ_RANK || proj_items[i].type == PROJ_DENSE_RANK) {
+                if (proj_items[i].has_partition) {
+                    for (int c = 0; c < proj_count; c++) {
+                        if (proj_items[c].type == PROJ_COL &&
+                            proj_items[c].binding.table == proj_items[i].partition_binding.table &&
+                            proj_items[c].binding.column == proj_items[i].partition_binding.column) {
+                            sort_keys[sort_count].proj_idx = c;
+                            sort_keys[sort_count].desc = false;
+                            sort_keys[sort_count].type = proj_items[c].data_type;
+                            sort_count++;
+                            break;
+                        }
+                    }
+                }
+                if (proj_items[i].raw_name.column[0]) {
+                    for (int c = 0; c < proj_count; c++) {
+                        if (proj_items[c].type == PROJ_COL &&
+                            proj_items[c].binding.table == proj_items[i].binding.table &&
+                            proj_items[c].binding.column == proj_items[i].binding.column) {
+                            sort_keys[sort_count].proj_idx = c;
+                            sort_keys[sort_count].desc = (proj_items[i].expr_op == 'D');
+                            sort_keys[sort_count].type = proj_items[c].data_type;
+                            sort_count++;
+                            break;
+                        }
+                    }
+                }
+                if (sort_count > 0) break;
+            }
+        }
+    } else if (sort_count > 0 && total_output_rows > 1) {
+        for (int i = 0; i < proj_count; i++) {
+            if ((proj_items[i].type == PROJ_ROW_NUMBER || proj_items[i].type == PROJ_RANK || proj_items[i].type == PROJ_DENSE_RANK) &&
+                proj_items[i].has_partition && sort_count < MAX_COLUMNS) {
+                int part_proj = -1;
+                for (int c = 0; c < proj_count; c++) {
+                    if (proj_items[c].type == PROJ_COL &&
+                        proj_items[c].binding.table == proj_items[i].partition_binding.table &&
+                        proj_items[c].binding.column == proj_items[i].partition_binding.column) {
+                        part_proj = c; break;
+                    }
+                }
+                if (part_proj >= 0 && sort_keys[0].proj_idx != part_proj) {
+                    for (int s = sort_count; s > 0; s--) sort_keys[s] = sort_keys[s - 1];
+                    sort_keys[0].proj_idx = part_proj;
+                    sort_keys[0].desc = false;
+                    sort_keys[0].type = proj_items[part_proj].data_type;
+                    sort_count++;
+                }
+                break;
+            }
+        }
+    }
+
     if (sort_count > 0 && total_output_rows > 1) {
-        g_sort_keys = sort_keys;
-        g_sort_key_count = sort_count;
-        qsort(rows, (size_t)total_output_rows, sizeof(RowData), compare_row_data);
+        sort_row_data(rows, total_output_rows, sort_keys, sort_count);
     }
 
     /* Window functions are evaluated over the final (sorted) row order so
        ROW_NUMBER() reflects ORDER BY and RANK() ties share a rank. */
     for (int i = 0; i < proj_count; i++) {
-        if (proj_items[i].type != PROJ_ROW_NUMBER && proj_items[i].type != PROJ_RANK) continue;
+        if (proj_items[i].type != PROJ_ROW_NUMBER && proj_items[i].type != PROJ_RANK && proj_items[i].type != PROJ_DENSE_RANK) continue;
         int order_idx = -1;
         bool order_desc = proj_items[i].expr_op == 'D';
         if (proj_items[i].raw_name.column[0] && !(proj_items[i].binding.table & 0x1000)) {
             for (int c = 0; c < proj_count; c++) {
-                if (proj_items[c].type == PROJ_COL && !proj_items[c].is_hidden &&
+                if (proj_items[c].type == PROJ_COL &&
                     proj_items[c].binding.table == proj_items[i].binding.table &&
                     proj_items[c].binding.column == proj_items[i].binding.column) {
                     order_idx = c;
@@ -1967,23 +2488,51 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
                 }
             }
         }
-        int rank = 0, seq = 0;
+        int part_idx = -1;
+        if (proj_items[i].has_partition && !(proj_items[i].partition_binding.table & 0x1000)) {
+            for (int c = 0; c < proj_count; c++) {
+                if (proj_items[c].type == PROJ_COL &&
+                    proj_items[c].binding.table == proj_items[i].partition_binding.table &&
+                    proj_items[c].binding.column == proj_items[i].partition_binding.column) {
+                    part_idx = c;
+                    break;
+                }
+            }
+        }
+        int rank = 0, seq = 0, dense_rank = 0;
         for (int r = 0; r < total_output_rows; r++) {
-            seq++;
-            if (proj_items[i].type == PROJ_ROW_NUMBER || order_idx < 0) {
-                rank = seq;
-            } else if (r == 0) {
+            bool partition_start = (r == 0);
+            if (part_idx >= 0 && r > 0) {
+                const Value* cur_p = &rows[r].cells[part_idx];
+                const Value* prev_p = &rows[r - 1].cells[part_idx];
+                if ((cur_p->is_null != prev_p->is_null) ||
+                    (!cur_p->is_null && !prev_p->is_null &&
+                     compare_typed_values(proj_items[part_idx].data_type, cur_p, prev_p) != 0)) {
+                    partition_start = true;
+                }
+            }
+            if (partition_start) {
+                seq = 1;
                 rank = 1;
+                dense_rank = 1;
             } else {
-                const Value* cur = &rows[r].cells[order_idx];
-                const Value* prev = &rows[r - 1].cells[order_idx];
-                bool same = (cur->is_null && prev->is_null) ||
-                    (!cur->is_null && !prev->is_null &&
-                     compare_typed_values(proj_items[order_idx].data_type, cur, prev) == 0);
-                rank = same ? rank : seq;
+                seq++;
+                if (proj_items[i].type == PROJ_ROW_NUMBER || order_idx < 0) {
+                    rank = seq;
+                    dense_rank = seq;
+                } else {
+                    const Value* cur = &rows[r].cells[order_idx];
+                    const Value* prev = &rows[r - 1].cells[order_idx];
+                    bool same = (cur->is_null && prev->is_null) ||
+                        (!cur->is_null && !prev->is_null &&
+                         compare_typed_values(proj_items[order_idx].data_type, cur, prev) == 0);
+                    rank = same ? rank : seq;
+                    dense_rank = same ? dense_rank : (dense_rank + 1);
+                }
             }
             (void)order_desc;
-            snprintf(rows[r].cells[i].text, sizeof(rows[r].cells[i].text), "%d", rank);
+            int out_val = (proj_items[i].type == PROJ_DENSE_RANK) ? dense_rank : rank;
+            snprintf(rows[r].cells[i].text, sizeof(rows[r].cells[i].text), "%d", out_val);
             rows[r].cells[i].is_null = false;
         }
     }
@@ -1997,6 +2546,10 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
 
     int num_rows = total_output_rows;
     out_capture->rows = malloc((size_t)(num_rows > 0 ? num_rows : 1) * sizeof(*out_capture->rows));
+    if (!out_capture->rows) {
+        report_database_error("out of memory capturing query results");
+        goto cleanup;
+    }
     out_capture->capacity = num_rows > 0 ? num_rows : 1;
     out_capture->row_count = 0;
     for (int r = 0; r < total_output_rows; r++) {
@@ -2011,6 +2564,7 @@ static bool execute_select_query_internal(Parser* p, QueryResultCapture* out_cap
     ok = true;
 
 cleanup:
+    g_select_max_needed = MAX_RESULTS;
     for (int i = 1; i < scope.count; i++) {
         if (use_hash[i]) join_index_destroy(&join_indexes[i]);
     }
@@ -2176,10 +2730,12 @@ bool execute_with_query(Parser* p) {
 
     if (!consume_keyword(p, "SELECT")) {
         release_table_storage(&g_db->tables[--g_db->table_count]);
+        memset(&g_db->tables[g_db->table_count], 0, sizeof(Table));
         return report_database_error("expected SELECT following WITH clause");
     }
 
     bool ok = execute_select_query(p);
     release_table_storage(&g_db->tables[--g_db->table_count]);
+    memset(&g_db->tables[g_db->table_count], 0, sizeof(Table));
     return ok;
 }

@@ -82,6 +82,7 @@ static uint32_t btree_find_leaf_with_parent(BufferPool* bp, int fd, uint32_t roo
 }
 
 bool btree_search(BufferPool* bp, int fd, uint32_t root_page, DataType key_type, const Value* key, uint32_t* out_page, int* out_slot) {
+    if (!key || !out_page || !out_slot) return false;
     uint32_t leaf_id = btree_find_leaf_with_parent(bp, fd, root_page, key_type, key, NULL);
     if (leaf_id == UINT32_MAX) return false;
 
@@ -186,6 +187,10 @@ bool btree_insert(BufferPool* bp, int fd, uint32_t* root_page, DataType key_type
             root_internal->hdr.item_count = 1;
             buffer_pool_unpin(bp, new_root_id, true);
             *root_page = new_root_id;
+        } else {
+            buffer_pool_unpin(bp, leaf_id, false);
+            buffer_pool_unpin(bp, new_leaf_id, false);
+            return report_database_error("cannot allocate root page for B+ tree");
         }
     } else if (parent_id != UINT32_MAX) {
         uint8_t* parent_p = buffer_pool_fetch(bp, fd, parent_id, true);
@@ -218,7 +223,7 @@ bool btree_insert(BufferPool* bp, int fd, uint32_t* root_page, DataType key_type
 }
 
 int btree_range_scan(BufferPool* bp, int fd, uint32_t root_page, DataType key_type, const Value* low, const Value* high, uint32_t* out_pages, int* out_slots, int max_results) {
-    if (!low) return 0;
+    if (!low || !out_pages || !out_slots || max_results <= 0) return 0;
     uint32_t leaf_id = btree_find_leaf_with_parent(bp, fd, root_page, key_type, low, NULL);
     if (leaf_id == UINT32_MAX) return 0;
 

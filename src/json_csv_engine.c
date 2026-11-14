@@ -191,7 +191,44 @@ bool import_table_csv(Database* db, const char* table_name, const char* filepath
     char uname[MAX_NAME_LEN];
     normalize_table_name(table_name, uname, sizeof(uname));
     int tidx = find_table_index(db, uname);
-    if (tidx < 0) return report_database_error("table does not exist: %s", table_name);
+    if (tidx < 0) {
+        FILE* hfp = fopen(filepath, "r");
+        if (!hfp) return report_database_error("cannot open file for reading: %s", filepath);
+        char hline[MAX_QUERY_LEN];
+        if (!fgets(hline, sizeof(hline), hfp)) {
+            fclose(hfp);
+            return report_database_error("CSV file is empty: %s", filepath);
+        }
+        fclose(hfp);
+        char (*hfields)[MAX_VAL_LEN] = calloc(MAX_COLUMNS, sizeof(*hfields));
+        if (!hfields) return report_database_error("out of memory");
+        bool hquoted[MAX_COLUMNS] = {false};
+        int hcount = 0;
+        if (!csv_parse_record(hline, hfields, hquoted, &hcount) || hcount < 1) {
+            free(hfields);
+            return report_database_error("cannot parse CSV header in %s", filepath);
+        }
+        if (db->table_count >= MAX_TABLES) {
+            free(hfields);
+            return report_database_error("table limit reached");
+        }
+        char col_names[MAX_COLUMNS][MAX_NAME_LEN] = {{0}};
+        Table* nt = &db->tables[db->table_count];
+        memset(nt, 0, sizeof(*nt));
+        memcpy(nt->name, uname, sizeof(nt->name));
+        nt->col_count = hcount;
+        for (int c = 0; c < hcount; c++) {
+            csv_unique_column_identifier(hfields[c], c + 1, col_names, c, nt->columns[c].name);
+            memcpy(col_names[c], nt->columns[c].name, MAX_NAME_LEN);
+            nt->columns[c].type = TYPE_VARCHAR2;
+            nt->columns[c].size = 255;
+            nt->columns[c].nullable = true;
+        }
+        free(hfields);
+        if (!allocate_table_storage(nt, 64)) return report_database_error("out of memory");
+        tidx = db->table_count++;
+        has_header = true;
+    }
     Table* t = &db->tables[tidx];
     if (!ensure_table_writable(t)) return report_database_error("table is not writable");
 
@@ -467,8 +504,7 @@ bool run_csv_import_wizard(Database* db) {
         } else if (has_sample[c] && all_dates[c]) {
             snprintf(column_types[c], sizeof(column_types[c]), "DATE");
         } else {
-            int size = max_lengths[c] < 1 ? 1 : max_lengths[c];
-            snprintf(column_types[c], sizeof(column_types[c]), "VARCHAR2(%d)", size);
+            snprintf(column_types[c], sizeof(column_types[c]), "VARCHAR2(255)");
         }
     }
 
@@ -681,7 +717,7 @@ bool extract_json_value(const char* json, const char* path, char* out_val, size_
                 }
             }
         }
-        p++;
+        if (*p) p++;
     }
     return false;
 }
@@ -726,16 +762,24 @@ bool import_table_json(Database* db, const char* table_name, const char* filepat
         ptr++;
         bool in_q = false;
         bool obj_complete = false;
+        int brace_depth = 1;
         while (*ptr) {
             if (*ptr == '"') {
                 /* A quote is escaped only when preceded by an odd run of backslashes. */
                 size_t backslashes = 0;
                 for (char* q = ptr - 1; q >= buf && *q == '\\'; q--) backslashes++;
                 if (backslashes % 2 == 0) in_q = !in_q;
-            } else if (!in_q && *ptr == '}') {
-                ptr++;
-                obj_complete = true;
-                break;
+            } else if (!in_q) {
+                if (*ptr == '{') {
+                    brace_depth++;
+                } else if (*ptr == '}') {
+                    brace_depth--;
+                    if (brace_depth == 0) {
+                        ptr++;
+                        obj_complete = true;
+                        break;
+                    }
+                }
             }
             ptr++;
         }
@@ -768,11 +812,15 @@ bool import_table_json(Database* db, const char* table_name, const char* filepat
         const char* p = obj_start + 1;
         while (*p && *p != '}') {
             while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') p++;
+            if (!*p || *p == '}') break;
             if (*p == '"') {
                 p++;
                 char kbuf[MAX_NAME_LEN];
                 size_t kidx = 0;
-                while (*p && *p != '"' && kidx + 1 < sizeof(kbuf)) kbuf[kidx++] = *p++;
+                while (*p && *p != '"') {
+                    if (kidx + 1 < sizeof(kbuf)) kbuf[kidx++] = *p;
+                    p++;
+                }
                 kbuf[kidx] = '\0';
                 if (*p == '"') p++;
                 while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -784,15 +832,16 @@ bool import_table_json(Database* db, const char* table_name, const char* filepat
                 bool is_null = false;
                 if (*p == '"') {
                     p++;
-                    while (*p && *p != '"' && vidx + 1 < sizeof(vbuf)) {
+                    while (*p && *p != '"') {
                         if (*p == '\\' && *(p + 1)) {
                             p++;
-                            if (*p == 'n') vbuf[vidx++] = '\n';
-                            else if (*p == 'r') vbuf[vidx++] = '\r';
-                            else if (*p == 't') vbuf[vidx++] = '\t';
-                            else vbuf[vidx++] = *p;
+                            char ch = *p;
+                            if (ch == 'n') ch = '\n';
+                            else if (ch == 'r') ch = '\r';
+                            else if (ch == 't') ch = '\t';
+                            if (vidx + 1 < sizeof(vbuf)) vbuf[vidx++] = ch;
                         } else {
-                            vbuf[vidx++] = *p;
+                            if (vidx + 1 < sizeof(vbuf)) vbuf[vidx++] = *p;
                         }
                         p++;
                     }
@@ -801,9 +850,32 @@ bool import_table_json(Database* db, const char* table_name, const char* filepat
                 } else if (!strncmp(p, "null", 4)) {
                     is_null = true;
                     p += 4;
+                } else if (*p == '{' || *p == '[') {
+                    char open_ch = *p;
+                    char close_ch = (open_ch == '{') ? '}' : ']';
+                    int depth = 0;
+                    bool in_str = false;
+                    while (*p) {
+                        if (*p == '"' && (p == buf || *(p - 1) != '\\')) {
+                            in_str = !in_str;
+                        } else if (!in_str) {
+                            if (*p == open_ch) depth++;
+                            else if (*p == close_ch) {
+                                depth--;
+                                if (vidx + 1 < sizeof(vbuf)) vbuf[vidx++] = *p;
+                                p++;
+                                if (depth == 0) break;
+                                continue;
+                            }
+                        }
+                        if (vidx + 1 < sizeof(vbuf)) vbuf[vidx++] = *p;
+                        p++;
+                    }
+                    vbuf[vidx] = '\0';
                 } else {
-                    while (*p && *p != ',' && *p != '}' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && vidx + 1 < sizeof(vbuf)) {
-                        vbuf[vidx++] = *p++;
+                    while (*p && *p != ',' && *p != '}' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+                        if (vidx + 1 < sizeof(vbuf)) vbuf[vidx++] = *p;
+                        p++;
                     }
                     vbuf[vidx] = '\0';
                 }
@@ -1121,14 +1193,12 @@ static bool import_database_external_file(Database* db, const char* table_name, 
                     destroy_database(imported_db);
                     return false;
                 }
-                Row* new_row = calloc(1, sizeof(Row));
-                if (!new_row) { destroy_database(imported_db); return report_database_error("out of memory"); }
+                Row* new_row = &dst_t->rows[dst_t->row_count++];
+                memset(new_row, 0, sizeof(*new_row));
                 for (int c = 0; c < dst_t->col_count; c++) {
                     if (c < src_t->col_count) new_row->values[c] = src_t->rows[r].values[c];
                     else new_row->values[c].is_null = true;
                 }
-                dst_t->rows[dst_t->row_count++] = *new_row;
-                free(new_row);
                 rows_imported++;
             }
         }
@@ -1153,16 +1223,24 @@ static bool import_database_external_file(Database* db, const char* table_name, 
         if ((uppercase_ascii(trimmed[0]) == 'G' && uppercase_ascii(trimmed[1]) == 'O' &&
              (trimmed[2] == '\r' || trimmed[2] == '\n' || trimmed[2] == '\0' || trimmed[2] == ' ')) ||
             (trimmed[0] == '/' && (trimmed[1] == '\r' || trimmed[1] == '\n' || trimmed[1] == '\0'))) {
-            continue;
+            if (stmt_len > 0) {
+                if (stmt_len + 2 < sizeof(stmt_buf)) {
+                    stmt_buf[stmt_len++] = ';';
+                    stmt_buf[stmt_len] = '\0';
+                }
+            } else {
+                continue;
+            }
+        } else {
+            size_t llen = strlen(line);
+            if (stmt_len + llen + 1 >= sizeof(stmt_buf)) {
+                fclose(fp);
+                return report_database_error("statement too long in %s script", label);
+            }
+            memcpy(stmt_buf + stmt_len, line, llen);
+            stmt_len += llen;
+            stmt_buf[stmt_len] = '\0';
         }
-        size_t llen = strlen(line);
-        if (stmt_len + llen + 1 >= sizeof(stmt_buf)) {
-            fclose(fp);
-            return report_database_error("statement too long in %s script", label);
-        }
-        memcpy(stmt_buf + stmt_len, line, llen);
-        stmt_len += llen;
-        stmt_buf[stmt_len] = '\0';
 
         char* semi = strchr(stmt_buf, ';');
         while (semi) {
@@ -1272,6 +1350,8 @@ bool diff_database_schema(const Database* db, const char* other_db_path) {
 }
 
 bool execute_export_statement(Parser* p) {
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: EXPORT requires the ADMIN role");
     if (consume_keyword(p, "MSSQL") || consume_keyword(p, "ORACLE")) {
         /* Handled by checking token before consume; let's support both forms below */
     }
@@ -1320,10 +1400,38 @@ bool execute_export_statement(Parser* p) {
 
 bool execute_import_statement(Parser* p) {
     if (g_readonly) return report_database_error("cannot IMPORT in read-only mode");
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: IMPORT requires the ADMIN role");
     if (g_raft_role == RAFT_FOLLOWER) return report_database_error("follower nodes accept read-only queries");
     if (consume_keyword(p, "WIZARD")) {
         if (!consume_statement_end(p)) return false;
         return run_csv_import_wizard(g_db);
+    }
+    if (p->kind == TK_STRING || token_is_keyword(p, "FILE")) {
+        if (token_is_keyword(p, "FILE")) scan_next_token(p);
+        if (p->kind != TK_STRING) return report_database_error("expected source file path string literal");
+        char filepath[PATH_CAP];
+        snprintf(filepath, sizeof(filepath), "%s", p->text);
+        scan_next_token(p);
+        char tbl[MAX_NAME_LEN] = {0};
+        if (consume_keyword(p, "INTO") || consume_keyword(p, "TABLE")) {
+            if (!parse_identifier(p, tbl)) return report_database_error("expected table name after INTO");
+        } else {
+            const char* base = strrchr(filepath, '/');
+            if (!base) base = strrchr(filepath, '\\');
+            base = base ? base + 1 : filepath;
+            size_t k = 0;
+            while (base[k] && base[k] != '.' && k + 1 < sizeof(tbl)) {
+                tbl[k] = uppercase_ascii(base[k]);
+                k++;
+            }
+            tbl[k] = '\0';
+        }
+        if (!consume_statement_end(p)) return false;
+        const char* dot = strrchr(filepath, '.');
+        bool is_json_file = (dot && (!strcmp(dot, ".json") || !strcmp(dot, ".JSON")));
+        if (is_json_file) return import_table_json(g_db, tbl, filepath);
+        return import_table_csv(g_db, tbl, filepath, true);
     }
     char tbl[MAX_NAME_LEN] = {0};
     bool is_csv = false, is_json = false, is_mssql = false, is_oracle = false;

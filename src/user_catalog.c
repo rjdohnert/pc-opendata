@@ -198,6 +198,9 @@ bool execute_user_catalog_statement(Parser* p, const char* command) {
         return capture_user_list(g_db);
     }
 
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: user administration requires the ADMIN role");
+
     if (g_readonly || g_raft_role == RAFT_FOLLOWER)
         return report_database_error("user catalog changes are unavailable in read-only mode");
     if (g_io_uncertain || atomic_load(&g_backup_failed))
@@ -216,23 +219,38 @@ bool execute_user_catalog_statement(Parser* p, const char* command) {
         snprintf(operation, sizeof(operation), "CREATE USER");
         UserRole role;
         if (consume_keyword(p, "USER") && parse_user_name(p, name, sizeof(name)) &&
-            consume_keyword(p, "IDENTIFIED") && consume_keyword(p, "BY") &&
-            p->kind == TK_STRING && strlen(p->text) < sizeof(password)) {
-            memcpy(password, p->text, strlen(p->text) + 1);
-            scan_next_token(p);
-            ok = consume_keyword(p, "ROLE") && parse_role(p, &role) &&
-                 consume_statement_end(p);
-            if (ok && find_user_index(candidate, name) >= 0) {
-                ok = report_database_error("user already exists");
-            } else if (ok && candidate->user_count >= MAX_USERS) {
-                ok = report_database_error("user catalog limit reached");
-            } else if (ok) {
-                UserAccount* account = &candidate->users[candidate->user_count];
-                memset(account, 0, sizeof(*account));
-                snprintf(account->name, sizeof(account->name), "%s", name);
-                account->role = role;
-                ok = set_user_password(account, password);
-                if (ok) candidate->user_count++;
+            consume_keyword(p, "IDENTIFIED") && consume_keyword(p, "BY")) {
+            bool has_pw = false;
+            if (consume_keyword(p, "PROMPT")) {
+                if (g_network_user[0]) {
+                    destroy_database(candidate);
+                    return report_database_error("password PROMPT is not supported in network sessions");
+                }
+                char pbuf[MAX_VAL_LEN];
+                if (read_masked_password("Enter password: ", pbuf, sizeof(pbuf))) {
+                    snprintf(password, sizeof(password), "%s", pbuf);
+                    has_pw = true;
+                }
+            } else if (p->kind == TK_STRING && strlen(p->text) < sizeof(password)) {
+                memcpy(password, p->text, strlen(p->text) + 1);
+                scan_next_token(p);
+                has_pw = true;
+            }
+            if (has_pw) {
+                ok = consume_keyword(p, "ROLE") && parse_role(p, &role) &&
+                     consume_statement_end(p);
+                if (ok && find_user_index(candidate, name) >= 0) {
+                    ok = report_database_error("user already exists");
+                } else if (ok && candidate->user_count >= MAX_USERS) {
+                    ok = report_database_error("user catalog limit reached");
+                } else if (ok) {
+                    UserAccount* account = &candidate->users[candidate->user_count];
+                    memset(account, 0, sizeof(*account));
+                    snprintf(account->name, sizeof(account->name), "%s", name);
+                    account->role = role;
+                    ok = set_user_password(account, password);
+                    if (ok) candidate->user_count++;
+                }
             }
         }
     } else if (!strcmp(command, "ALTER")) {
@@ -241,13 +259,28 @@ bool execute_user_catalog_statement(Parser* p, const char* command) {
             index = find_user_index(candidate, name);
             if (index < 0) {
                 ok = report_database_error("user does not exist");
-            } else if (consume_keyword(p, "PASSWORD") && p->kind == TK_STRING &&
-                       strlen(p->text) < sizeof(password)) {
+            } else if (consume_keyword(p, "PASSWORD") || (consume_keyword(p, "IDENTIFIED") && consume_keyword(p, "BY"))) {
                 snprintf(operation, sizeof(operation), "ALTER USER PASSWORD");
-                memcpy(password, p->text, strlen(p->text) + 1);
-                scan_next_token(p);
-                ok = consume_statement_end(p) &&
-                     set_user_password(&candidate->users[index], password);
+                bool has_pw = false;
+                if (consume_keyword(p, "PROMPT")) {
+                    if (g_network_user[0]) {
+                        destroy_database(candidate);
+                        return report_database_error("password PROMPT is not supported in network sessions");
+                    }
+                    char pbuf[MAX_VAL_LEN];
+                    if (read_masked_password("Enter new password: ", pbuf, sizeof(pbuf))) {
+                        snprintf(password, sizeof(password), "%s", pbuf);
+                        has_pw = true;
+                    }
+                } else if (p->kind == TK_STRING && strlen(p->text) < sizeof(password)) {
+                    memcpy(password, p->text, strlen(p->text) + 1);
+                    scan_next_token(p);
+                    has_pw = true;
+                }
+                if (has_pw) {
+                    ok = consume_statement_end(p) &&
+                         set_user_password(&candidate->users[index], password);
+                }
             } else if (consume_keyword(p, "ROLE")) {
                 snprintf(operation, sizeof(operation), "ALTER USER ROLE");
                 UserRole role;
@@ -313,9 +346,9 @@ static int find_grant_index(const Database* db, const char* user, const char* ta
 
 bool user_has_table_privilege(const Database* db, const char* user, const char* table, uint32_t privilege) {
     if (!db || !user || !user[0] || !table) return true;
+    if (g_network_user_role == USER_ROLE_ADMIN) return true;
     int idx = find_user_index(db, user);
-    if (idx < 0) return false;
-    if (db->users[idx].role == USER_ROLE_ADMIN) return true;
+    if (idx >= 0 && db->users[idx].role == USER_ROLE_ADMIN) return true;
     int grant = find_grant_index(db, user, table);
     return grant >= 0 && (db->grants[grant].privileges & privilege) == privilege;
 }
@@ -368,6 +401,8 @@ static bool capture_grant_list(const Database* db) {
 
 bool execute_grant_statement(Parser* p, bool granting) {
     if (!g_db) return report_database_error("not connected to any database");
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN)
+        return report_database_error("permission denied: GRANT/REVOKE requires the ADMIN role");
     if (g_readonly || g_raft_role == RAFT_FOLLOWER)
         return report_database_error("grant changes are unavailable in read-only mode");
     if (g_io_uncertain || atomic_load(&g_backup_failed))

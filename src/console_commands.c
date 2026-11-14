@@ -2,9 +2,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <conio.h>
+#include <io.h>
 #else
 #include <dirent.h>
 #include <sys/stat.h>
+#include <termios.h>
+#include <unistd.h>
 #endif
 
 #define MAX_HISTORY_ENTRIES 100
@@ -18,6 +22,7 @@ static void shell_printf(const char* fmt, ...);
 typedef enum {
     CONFIRM_ALLOW,
     CONFIRM_CANCEL,
+    CONFIRM_DRYRUN,
     CONFIRM_ERROR
 } ConfirmationResult;
 
@@ -25,25 +30,187 @@ static bool shell_has_interactive_input(void) {
     return g_interactive_shell;
 }
 
-static ConfirmationResult confirm_destructive_action(const char* explanation,
+void format_human_size(uint64_t bytes, char* buf, size_t buf_size);
+
+void show_destructive_dry_run(const char* action, const char* target_name, const char* extra_info) {
+    shell_puts("\n================================================================================");
+    shell_puts("                    PC/OpenData Dry-Run Impact Analysis");
+    shell_puts("================================================================================");
+    shell_printf("  Operation:           %s\n", action ? action : "DESTRUCTIVE MUTATION");
+    shell_printf("  Target Object:       %s\n", target_name && *target_name ? target_name : "(unspecified)");
+    if (g_path[0]) {
+        shell_printf("  Database File:       %s (Snapshot Generation: %llu)\n", g_path, (unsigned long long)g_generation);
+    } else {
+        shell_puts("  Database File:       (In-Memory Transient Session)");
+    }
+    
+    if (action && (!strcmp(action, "DROP TABLE") || !strcmp(action, "TRUNCATE TABLE"))) {
+        int idx = (g_db && target_name) ? find_table_index(g_db, target_name) : -1;
+        if (idx >= 0) {
+            const Table* tbl = &g_db->tables[idx];
+            shell_printf("  Storage Engine:      %s\n", tbl->engine_type == ENGINE_DISK ? "DISK (B-Tree)" : "MEMORY");
+            shell_printf("  Current Rows:        %d row(s)\n", tbl->row_count);
+            shell_printf("  Columns (%d):         ", tbl->col_count);
+            for (int c = 0; c < tbl->col_count; c++) {
+                shell_printf("%s%s", tbl->columns[c].name, c + 1 < tbl->col_count ? ", " : "\n");
+            }
+            int idx_count = 0;
+            if (g_db) {
+                for (int i = 0; i < g_db->index_count; i++) {
+                    if (!strcmp(g_db->indexes[i].table_name, target_name)) idx_count++;
+                }
+            }
+            shell_printf("  Indexes to %s: %d index(es)\n",
+                         !strcmp(action, "DROP TABLE") ? "Drop" : "Clear", idx_count);
+            if (idx_count > 0 && g_db) {
+                for (int i = 0; i < g_db->index_count; i++) {
+                    if (!strcmp(g_db->indexes[i].table_name, target_name)) {
+                        shell_printf("                         - %s\n", g_db->indexes[i].name);
+                    }
+                }
+            }
+            int fk_refs = 0;
+            if (g_db) {
+                for (int t = 0; t < g_db->table_count; t++) {
+                    if (t == idx) continue;
+                    const Table* other = &g_db->tables[t];
+                    for (int c = 0; c < other->col_count; c++) {
+                        if (!strcmp(other->columns[c].ref_table, target_name)) {
+                            if (fk_refs == 0) shell_puts("  Foreign Key Impact:  Dependent tables referencing this table:");
+                            shell_printf("                         - %s.%s -> %s.%s\n",
+                                         other->name, other->columns[c].name, target_name, other->columns[c].ref_column);
+                            fk_refs++;
+                        }
+                    }
+                }
+            }
+            if (fk_refs == 0) {
+                shell_puts("  Foreign Key Impact:  No foreign key dependencies found.");
+            }
+            size_t est_bytes = (size_t)tbl->row_count * (size_t)(tbl->col_count * 20);
+            char sz_buf[32];
+            format_human_size((uint64_t)est_bytes, sz_buf, sizeof(sz_buf));
+            shell_printf("  Estimated Storage:   ~%s of row data\n", sz_buf);
+            if (!strcmp(action, "DROP TABLE")) {
+                shell_puts("  Schema Persistence:  Table schema and data will be permanently unlinked.");
+            } else {
+                shell_puts("  Schema Persistence:  Table schema and column definitions will be preserved.");
+            }
+        } else {
+            shell_printf("  Notice:              Table '%s' does not exist in current database.\n", target_name ? target_name : "");
+        }
+    } else if (action && (!strcmp(action, "DELETE FROM") || !strcmp(action, "UPDATE"))) {
+        int idx = (g_db && target_name) ? find_table_index(g_db, target_name) : -1;
+        if (idx >= 0) {
+            const Table* tbl = &g_db->tables[idx];
+            shell_printf("  Target Table:        %s (%d total rows)\n", tbl->name, tbl->row_count);
+            if (extra_info && *extra_info) {
+                shell_printf("  Filter Condition:    %s\n", extra_info);
+            } else {
+                shell_puts("  Filter Condition:    None (UNCONDITIONAL - affects ALL rows!)");
+            }
+            if (!strcmp(action, "DELETE FROM")) {
+                shell_printf("  Impact:              %s will be deleted.\n",
+                             (extra_info && *extra_info) ? "Matching rows" : "ALL rows");
+            } else {
+                shell_printf("  Impact:              %s will be modified.\n",
+                             (extra_info && *extra_info) ? "Matching rows" : "ALL rows");
+            }
+        }
+    } else if (action && !strcmp(action, "DROP DATABASE")) {
+        shell_printf("  Database Path:       %s\n", target_name ? target_name : "");
+        if (target_name && snapshot_path_exists(target_name)) {
+            shell_puts("  File Status:         File exists on disk.");
+            shell_puts("  Impact:              Database snapshot file and WAL will be deleted permanently.");
+        } else {
+            shell_puts("  File Status:         File does not exist or cannot be accessed.");
+        }
+    } else if (action && !strcmp(action, "DROP USER")) {
+        shell_printf("  User Account:        %s\n", target_name ? target_name : "");
+        shell_puts("  Impact:              User credentials, permissions, and active sessions revoked.");
+    }
+    if (extra_info && *extra_info && action && strcmp(action, "DELETE FROM") && strcmp(action, "UPDATE")) {
+        shell_printf("  Details:             %s\n", extra_info);
+    }
+    shell_puts("--------------------------------------------------------------------------------");
+    shell_puts("RESULT: Dry-run test complete. Database file has NOT been modified.");
+    shell_puts("================================================================================\n");
+}
+
+static ConfirmationResult confirm_destructive_action(const char* action,
+                                                      const char* target,
+                                                      const char* explanation,
                                                       const char* expected) {
-    if (!shell_has_interactive_input()) return CONFIRM_ALLOW;
-    shell_printf("%s Type \"%s\" to continue: ", explanation, expected);
+    if (!shell_has_interactive_input() || !g_confirm_destructive) return CONFIRM_ALLOW;
+
+    shell_puts("\n--------------------------------------------------------------------------------");
+    shell_printf("WARNING: Destructive Operation Detected!\n");
+    shell_printf("  Operation: %s\n", action ? action : "DESTRUCTIVE STATEMENT");
+    if (target && *target) shell_printf("  Target:    %s\n", target);
+    if (explanation && *explanation) shell_printf("  Details:   %s\n", explanation);
+    shell_puts("--------------------------------------------------------------------------------");
+    shell_printf("Proceed? Type 'yes' (or 'y') to continue, 'no' (or Enter) to cancel,\n"
+                 "         or 'dry-run' (or 'test') to preview impact [y/N/test]: ");
     fflush(stdout);
+
     char response[96];
     if (!fgets(response, sizeof(response), stdin)) {
-        shell_puts("Cancelled; no changes made.");
+        shell_puts("Cancelled; database file has not been modified.");
         return ferror(stdin) ? CONFIRM_ERROR : CONFIRM_CANCEL;
     }
     size_t length = strlen(response);
     while (length > 0 && (response[length - 1] == '\r' || response[length - 1] == '\n'))
         response[--length] = '\0';
-    if (length == sizeof(response) - 1) return CONFIRM_ERROR;
-    if (strcmp(response, expected)) {
-        shell_puts("Cancelled; no changes made.");
+    while (length > 0 && is_sql_whitespace(response[length - 1]))
+        response[--length] = '\0';
+    const char* rptr = response;
+    while (is_sql_whitespace(*rptr)) rptr++;
+
+    if (!*rptr || !strcmp(rptr, "n") || !strcmp(rptr, "no") || !strcmp(rptr, "N") ||
+        !strcmp(rptr, "NO") || !strcmp(rptr, "cancel") || !strcmp(rptr, "deny")) {
+        shell_puts("Cancelled; database file has not been modified.");
         return CONFIRM_CANCEL;
     }
-    return CONFIRM_ALLOW;
+
+    if (!strcmp(rptr, "test") || !strcmp(rptr, "TEST") ||
+        !strcmp(rptr, "dry-run") || !strcmp(rptr, "dryrun") ||
+        !strcmp(rptr, "d") || !strcmp(rptr, "D") || !strcmp(rptr, "explain")) {
+        return CONFIRM_DRYRUN;
+    }
+
+    if (!strcmp(rptr, "y") || !strcmp(rptr, "yes") || !strcmp(rptr, "Y") ||
+        !strcmp(rptr, "YES") || (expected && !strcmp(rptr, expected))) {
+        return CONFIRM_ALLOW;
+    }
+
+    shell_puts("Cancelled; unrecognized confirmation response.");
+    return CONFIRM_CANCEL;
+}
+
+static bool handle_confirmation_with_dryrun(ConfirmationResult* conf,
+                                             const char* action,
+                                             const char* target,
+                                             const char* extra) {
+    if (*conf == CONFIRM_DRYRUN) {
+        show_destructive_dry_run(action, target, extra);
+        shell_printf("Would you like to execute '%s %s' now? [y/N]: ", action ? action : "", target ? target : "");
+        fflush(stdout);
+        char final_resp[32] = {0};
+        if (fgets(final_resp, sizeof(final_resp), stdin)) {
+            size_t flen = strlen(final_resp);
+            while (flen > 0 && (final_resp[flen - 1] == '\r' || final_resp[flen - 1] == '\n')) final_resp[--flen] = '\0';
+            const char* fr = final_resp;
+            while (is_sql_whitespace(*fr)) fr++;
+            if (!strcmp(fr, "y") || !strcmp(fr, "yes") || !strcmp(fr, "Y") || !strcmp(fr, "YES")) {
+                *conf = CONFIRM_ALLOW;
+                return true;
+            }
+        }
+        shell_puts("Cancelled; database file has not been modified.");
+        *conf = CONFIRM_CANCEL;
+        return true;
+    }
+    return false;
 }
 
 static bool allow_or_report_confirmation(ConfirmationResult result) {
@@ -52,7 +219,8 @@ static bool allow_or_report_confirmation(ConfirmationResult result) {
     return result == CONFIRM_ALLOW;
 }
 
-static int edit_distance_capped(const char* a, const char* b, int cap) {
+int edit_distance_capped(const char* a, const char* b, int cap) {
+    if (!a || !b || cap < 0) return cap < 0 ? 0 : cap + 1;
     size_t la = strlen(a), lb = strlen(b);
     if (la >= MAX_NAME_LEN || lb >= MAX_NAME_LEN) return cap + 1;
     if (la > lb) {
@@ -104,7 +272,7 @@ static const char* suggest_command_word(const char* word) {
         "DISCONNECT", "EXIT", "QUIT", "BACKUP", "RESTART", "CHECK", "VACUUM",
         "COMPACT", "DUMP", "DIFF", "BENCHMARK", "WATCH", "HISTORY", "SPOOL",
         "SOURCE", "SET", "CLEAR", "CLS", "CANCEL", "PING", "LOAD", "SUPPORT",
-        "CONNECTION", "KILL", "IRIS", "EDIT", "VERIFY"
+        "CONNECTION", "KILL", "IRIS", "EDIT", "VERIFY", "SELFTEST", "SELF_TEST"
     };
     return suggest_word(word, commands, sizeof(commands) / sizeof(commands[0]));
 }
@@ -118,7 +286,7 @@ static const char* suggest_show_word(const char* word) {
 }
 
 static void shell_puts(const char* s) {
-    puts(s);
+    if (!g_silent_mode) puts(s);
     if (g_spool_file) {
         fputs(s, g_spool_file);
         fputc('\n', g_spool_file);
@@ -127,10 +295,12 @@ static void shell_puts(const char* s) {
 }
 
 static void shell_printf(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
+    if (!g_silent_mode) {
+        va_list args;
+        va_start(args, fmt);
+        vprintf(fmt, args);
+        va_end(args);
+    }
     if (g_spool_file) {
         va_list args2;
         va_start(args2, fmt);
@@ -140,18 +310,717 @@ static void shell_printf(const char* fmt, ...) {
     }
 }
 
-static void record_history(const char* stmt) {
-    while (is_sql_whitespace(*stmt)) stmt++;
-    if (!*stmt) return;
+
+bool read_masked_password(const char* prompt, char* buffer, size_t max_len) {
+    if (!prompt || !buffer || max_len == 0) return false;
+    buffer[0] = '\0';
+    fputs(prompt, stdout);
+    fflush(stdout);
+#ifdef _WIN32
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(hStdin, &mode)) {
+        SetConsoleMode(hStdin, mode & ~(DWORD)(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT));
+    }
+    size_t idx = 0;
+    for (;;) {
+        DWORD read_bytes = 0;
+        char ch = 0;
+        if (!ReadFile(hStdin, &ch, 1, &read_bytes, NULL) || read_bytes == 0) break;
+        if (ch == '\r' || ch == '\n') {
+            break;
+        } else if (ch == '\b' || ch == 127) {
+            if (idx > 0) {
+                idx--;
+                buffer[idx] = '\0';
+                fputs("\b \b", stdout);
+                fflush(stdout);
+            }
+        } else if (ch == 3) {
+            if (mode) SetConsoleMode(hStdin, mode);
+            fputs("^C\n", stdout);
+            fflush(stdout);
+            buffer[0] = '\0';
+            return false;
+        } else if ((unsigned char)ch >= 32 && idx + 1 < max_len) {
+            buffer[idx++] = ch;
+            buffer[idx] = '\0';
+            fputc('*', stdout);
+            fflush(stdout);
+        }
+    }
+    if (mode) SetConsoleMode(hStdin, mode);
+    fputc('\n', stdout);
+    fflush(stdout);
+    return true;
+#else
+    if (fgets(buffer, (int)max_len, stdin)) {
+        size_t len = strlen(buffer);
+        while (len > 0 && (buffer[len - 1] == '\r' || buffer[len - 1] == '\n')) buffer[--len] = '\0';
+        return true;
+    }
+    return false;
+#endif
+}
+
+
+
+const char* suggest_table_name(const Database* db, const char* typo) {
+    if (!db || !typo || !*typo) return NULL;
+    int best_dist = 4;
+    const char* best_match = NULL;
+    for (int t = 0; t < db->table_count; t++) {
+        int d = edit_distance_capped(typo, db->tables[t].name, 3);
+        if (d < best_dist) {
+            best_dist = d;
+            best_match = db->tables[t].name;
+        }
+    }
+    return best_match;
+}
+
+const char* suggest_column_name(const Table* table, const char* typo) {
+    if (!table || !typo || !*typo) return NULL;
+    int best_dist = 4;
+    const char* best_match = NULL;
+    for (int c = 0; c < table->col_count; c++) {
+        int d = edit_distance_capped(typo, table->columns[c].name, 3);
+        if (d < best_dist) {
+            best_dist = d;
+            best_match = table->columns[c].name;
+        }
+    }
+    return best_match;
+}
+
+bool report_table_not_found(const Database* db, const char* typo) {
+    const char* suggestion = suggest_table_name(db, typo);
+    if (suggestion) {
+        return report_database_error("table does not exist: %s. Did you mean '%s'?", typo, suggestion);
+    }
+    return report_database_error("table does not exist: %s", typo);
+}
+
+bool report_column_not_found(const Table* table, const char* typo) {
+    const char* suggestion = suggest_column_name(table, typo);
+    if (suggestion) {
+        return report_database_error("column '%s' not found in table '%s'. Did you mean '%s'?",
+                              typo, table ? table->name : "", suggestion);
+    }
+    return report_database_error("column '%s' not found%s%s",
+                              typo, table ? " in table " : "", table ? table->name : "");
+}
+
+void format_human_size(uint64_t bytes, char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return;
+    if (bytes < 1024) {
+        snprintf(buf, buf_size, "%llu B", (unsigned long long)bytes);
+    } else if (bytes < 1024ULL * 1024ULL) {
+        snprintf(buf, buf_size, "%.1f KB", (double)bytes / 1024.0);
+    } else if (bytes < 1024ULL * 1024ULL * 1024ULL) {
+        snprintf(buf, buf_size, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    } else {
+        snprintf(buf, buf_size, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+
+void format_relative_timestamp(time_t t, char* buf, size_t buf_size) {
+    if (!buf || buf_size == 0) return;
+    if (t == 0) { snprintf(buf, buf_size, "never"); return; }
+    time_t now = time(NULL);
+    long diff = (long)difftime(now, t);
+    if (diff < 0) diff = 0;
+    if (diff < 60) snprintf(buf, buf_size, "%ld sec%s ago", diff, diff == 1 ? "" : "s");
+    else if (diff < 3600) snprintf(buf, buf_size, "%ld min%s ago", diff / 60, (diff / 60) == 1 ? "" : "s");
+    else if (diff < 86400) snprintf(buf, buf_size, "%ld hour%s ago", diff / 3600, (diff / 3600) == 1 ? "" : "s");
+    else snprintf(buf, buf_size, "%ld day%s ago", diff / 86400, (diff / 86400) == 1 ? "" : "s");
+}
+
+static void get_history_file_path(char* out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+#ifdef _WIN32
+    const char* home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOME");
+#else
+    const char* home = getenv("HOME");
+#endif
+    if (home && *home) {
+        snprintf(out, out_sz, "%s/.opendata_history", home);
+    }
+}
+
+void load_history_file(void) {
+    char path[PATH_CAP];
+    get_history_file_path(path, sizeof(path));
+    if (!path[0]) return;
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n')) line[--len] = '\0';
+        if (len > 0) record_history_entry(line);
+    }
+    fclose(f);
+}
+
+
+const char* get_history_entry(int index) {
+    if (index >= 0 && index < g_history_count) return g_history[index];
+    return NULL;
+}
+
+int get_history_count(void) {
+    return g_history_count;
+}
+
+void save_history_file(void) {
+    char path[PATH_CAP];
+    get_history_file_path(path, sizeof(path));
+    if (!path[0]) return;
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < g_history_count; i++) {
+        fprintf(f, "%s\n", g_history[i]);
+    }
+    fclose(f);
+}
+
+void record_history_entry(const char* line) {
+    if (!line) return;
+    while (is_sql_whitespace(*line)) line++;
+    if (!*line) return;
+    if (g_history_count > 0 && !strcmp(g_history[g_history_count - 1], line)) return;
     if (g_history_count < MAX_HISTORY_ENTRIES) {
-        snprintf(g_history[g_history_count++], sizeof(g_history[0]), "%s", stmt);
+        snprintf(g_history[g_history_count++], sizeof(g_history[0]), "%s", line);
     } else {
         for (int i = 1; i < MAX_HISTORY_ENTRIES; i++) {
             memcpy(g_history[i - 1], g_history[i], sizeof(g_history[0]));
         }
-        snprintf(g_history[MAX_HISTORY_ENTRIES - 1], sizeof(g_history[0]), "%s", stmt);
+        snprintf(g_history[MAX_HISTORY_ENTRIES - 1], sizeof(g_history[0]), "%s", line);
     }
 }
+
+bool history_expand(const char* in, char* out, size_t out_sz) {
+    if (!in || !out || out_sz == 0) return false;
+    while (is_sql_whitespace(*in)) in++;
+    if (*in != '!' || g_history_count == 0) {
+        snprintf(out, out_sz, "%s", in);
+        return false;
+    }
+    const char* target = NULL;
+    if (in[1] == '!') {
+        target = g_history[g_history_count - 1];
+    } else if (in[1] == '-' && is_ascii_digit(in[2])) {
+        int back = (int)strtol(in + 2, NULL, 10);
+        int idx = g_history_count - back;
+        if (idx >= 0 && idx < g_history_count) target = g_history[idx];
+    } else if (is_ascii_digit(in[1])) {
+        int idx = (int)strtol(in + 1, NULL, 10) - 1;
+        if (idx >= 0 && idx < g_history_count) target = g_history[idx];
+    } else if (in[1] != '\0') {
+        const char* prefix = in + 1;
+        size_t plen = strlen(prefix);
+        for (int i = g_history_count - 1; i >= 0; i--) {
+            if (!strncmp(g_history[i], prefix, plen)) {
+                target = g_history[i];
+                break;
+            }
+        }
+    }
+    if (target) {
+        snprintf(out, out_sz, "%s", target);
+        shell_printf("%s\n", out);
+        return true;
+    }
+    snprintf(out, out_sz, "%s", in);
+    return false;
+}
+
+static bool str_contains_nocase(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return false;
+    if (!*needle) return true;
+    size_t nlen = strlen(needle);
+    for (const char* h = haystack; *h; h++) {
+        size_t i = 0;
+        while (i < nlen && h[i] && (uppercase_ascii(h[i]) == uppercase_ascii(needle[i]))) i++;
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+static bool is_terminal_stdin(void) {
+#ifdef _WIN32
+    return _isatty(_fileno(stdin)) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+#ifndef _WIN32
+static struct termios s_orig_termios;
+static bool s_raw_mode_active = false;
+
+static void shell_disable_raw_mode(void) {
+    if (s_raw_mode_active) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
+        s_raw_mode_active = false;
+    }
+}
+
+static bool shell_enable_raw_mode(void) {
+    if (!isatty(STDIN_FILENO)) return false;
+    if (s_raw_mode_active) return true;
+    if (tcgetattr(STDIN_FILENO, &s_orig_termios) != 0) return false;
+    struct termios raw = s_orig_termios;
+    raw.c_lflag &= (tcflag_t)~(tcflag_t)(ECHO | ICANON | ISIG);
+    raw.c_iflag &= (tcflag_t)~(tcflag_t)(IXON | ICRNL);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return false;
+    s_raw_mode_active = true;
+    return true;
+}
+#endif
+
+int shell_read_key(void) {
+#ifdef _WIN32
+    int c = _getch();
+    if (c == 0 || c == 0xE0) {
+        int ext = _getch();
+        if (ext == 72) return SHELL_KEY_UP;
+        if (ext == 80) return SHELL_KEY_DOWN;
+        if (ext == 75) return SHELL_KEY_LEFT;
+        if (ext == 77) return SHELL_KEY_RIGHT;
+        if (ext == 71) return SHELL_KEY_HOME;
+        if (ext == 79) return SHELL_KEY_END;
+        if (ext == 83) return SHELL_KEY_DELETE;
+        return SHELL_KEY_NONE;
+    }
+    if (c == '\r') return SHELL_KEY_ENTER;
+    if (c == '\b') return SHELL_KEY_BACKSPACE;
+    return c;
+#else
+    bool need_restore = false;
+    if (!s_raw_mode_active && isatty(STDIN_FILENO)) {
+        if (shell_enable_raw_mode()) need_restore = true;
+    }
+    char c = 0;
+    int n = (int)read(STDIN_FILENO, &c, 1);
+    int res = SHELL_KEY_NONE;
+    if (n <= 0) {
+        res = SHELL_KEY_CTRL_D;
+    } else if (c == '\033') {
+        char seq[3] = {0};
+        if (read(STDIN_FILENO, &seq[0], 1) > 0 && read(STDIN_FILENO, &seq[1], 1) > 0) {
+            if (seq[0] == '[') {
+                if (seq[1] == 'A') res = SHELL_KEY_UP;
+                else if (seq[1] == 'B') res = SHELL_KEY_DOWN;
+                else if (seq[1] == 'C') res = SHELL_KEY_RIGHT;
+                else if (seq[1] == 'D') res = SHELL_KEY_LEFT;
+                else if (seq[1] == 'H') res = SHELL_KEY_HOME;
+                else if (seq[1] == 'F') res = SHELL_KEY_END;
+                else if (seq[1] >= '1' && seq[1] <= '4') {
+                    char t = 0;
+                    if (read(STDIN_FILENO, &t, 1) > 0 && t == '~') {
+                        if (seq[1] == '1') res = SHELL_KEY_HOME;
+                        else if (seq[1] == '3') res = SHELL_KEY_DELETE;
+                        else if (seq[1] == '4') res = SHELL_KEY_END;
+                    }
+                }
+            }
+        }
+    } else if (c == '\r' || c == '\n') {
+        res = SHELL_KEY_ENTER;
+    } else if (c == 127 || c == '\b') {
+        res = SHELL_KEY_BACKSPACE;
+    } else {
+        res = (unsigned char)c;
+    }
+    if (need_restore) shell_disable_raw_mode();
+    return res;
+#endif
+}
+
+char* read_interactive_line(const char* prompt, char* buf, size_t max_len) {
+    if (!buf || max_len == 0) return NULL;
+    buf[0] = '\0';
+    if (!is_terminal_stdin()) {
+        if (prompt && *prompt) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
+        if (!fgets(buf, (int)max_len, stdin)) return NULL;
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n')) buf[--len] = '\0';
+        return buf;
+    }
+
+    char* working = (char*)malloc(max_len);
+    if (!working) {
+        if (prompt && *prompt) {
+            fputs(prompt, stdout);
+            fflush(stdout);
+        }
+        if (!fgets(buf, (int)max_len, stdin)) return NULL;
+        size_t flen = strlen(buf);
+        while (flen > 0 && (buf[flen - 1] == '\r' || buf[flen - 1] == '\n')) buf[--flen] = '\0';
+        return buf;
+    }
+    working[0] = '\0';
+
+#ifndef _WIN32
+    bool raw_active = shell_enable_raw_mode();
+#endif
+
+    if (prompt && *prompt) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+    }
+    size_t len = 0;
+    size_t pos = 0;
+    int hist_nav = g_history_count;
+
+    for (;;) {
+        int k = shell_read_key();
+        if (k == SHELL_KEY_UP) {
+            if (g_history_count > 0 && hist_nav > 0) {
+                if (hist_nav == g_history_count) {
+                    snprintf(working, max_len, "%s", buf);
+                }
+                hist_nav--;
+                while (pos < len) { fputc(buf[pos++], stdout); }
+                while (pos > 0) { fputs("\b \b", stdout); pos--; }
+                snprintf(buf, max_len, "%s", g_history[hist_nav]);
+                len = strlen(buf);
+                pos = len;
+                fputs(buf, stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_DOWN) {
+            if (hist_nav < g_history_count) {
+                hist_nav++;
+                while (pos < len) { fputc(buf[pos++], stdout); }
+                while (pos > 0) { fputs("\b \b", stdout); pos--; }
+                if (hist_nav == g_history_count) {
+                    snprintf(buf, max_len, "%s", working);
+                } else {
+                    snprintf(buf, max_len, "%s", g_history[hist_nav]);
+                }
+                len = strlen(buf);
+                pos = len;
+                fputs(buf, stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_LEFT) {
+            if (pos > 0) {
+                pos--;
+                fputc('\b', stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_RIGHT) {
+            if (pos < len) {
+                fputc(buf[pos++], stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_HOME) {
+            while (pos > 0) {
+                fputc('\b', stdout);
+                pos--;
+            }
+            fflush(stdout);
+            continue;
+        }
+        if (k == SHELL_KEY_END) {
+            while (pos < len) {
+                fputc(buf[pos++], stdout);
+            }
+            fflush(stdout);
+            continue;
+        }
+        if (k == SHELL_KEY_DELETE) {
+            if (pos < len) {
+                memmove(buf + pos, buf + pos + 1, len - pos);
+                len--;
+                for (size_t i = pos; i < len; i++) fputc(buf[i], stdout);
+                fputc(' ', stdout);
+                for (size_t i = pos; i <= len; i++) fputc('\b', stdout);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_ENTER || k == '\n') {
+            fputc('\n', stdout);
+            fflush(stdout);
+            buf[len] = '\0';
+            free(working);
+#ifndef _WIN32
+            if (raw_active) shell_disable_raw_mode();
+#endif
+            return buf;
+        }
+        if (k == SHELL_KEY_CTRL_C) {
+            fputs("^C\n", stdout);
+            fflush(stdout);
+            buf[0] = '\0';
+            free(working);
+#ifndef _WIN32
+            if (raw_active) shell_disable_raw_mode();
+#endif
+            return buf;
+        }
+        if (k == SHELL_KEY_CTRL_D) {
+            if (len == 0) {
+                free(working);
+#ifndef _WIN32
+                if (raw_active) shell_disable_raw_mode();
+#endif
+                return NULL;
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_CTRL_R) {
+            char term[64] = {0};
+            size_t tlen = 0;
+            int matched_idx = -1;
+            int start_idx = g_history_count - 1;
+            for (;;) {
+                fputs("\r                                                                               \r", stdout);
+                shell_printf("(reverse-i-search)'%s': %s", term, matched_idx >= 0 ? g_history[matched_idx] : "");
+                fflush(stdout);
+                int sk = shell_read_key();
+                if (sk == SHELL_KEY_CTRL_R) {
+                    if (matched_idx > 0) {
+                        start_idx = matched_idx - 1;
+                        matched_idx = -1;
+                        for (int h = start_idx; h >= 0; h--) {
+                            if (tlen == 0 || str_contains_nocase(g_history[h], term)) {
+                                matched_idx = h;
+                                break;
+                            }
+                        }
+                    }
+                } else if (sk == SHELL_KEY_BACKSPACE) {
+                    if (tlen > 0) {
+                        term[--tlen] = '\0';
+                        matched_idx = -1;
+                        for (int h = g_history_count - 1; h >= 0; h--) {
+                            if (tlen == 0 || str_contains_nocase(g_history[h], term)) {
+                                matched_idx = h;
+                                break;
+                            }
+                        }
+                    }
+                } else if (sk == SHELL_KEY_ENTER || sk == '\n') {
+                    fputs("\r                                                                               \r", stdout);
+                    if (matched_idx >= 0) {
+                        snprintf(buf, max_len, "%s", g_history[matched_idx]);
+                        len = strlen(buf);
+                        pos = len;
+                    }
+                    if (prompt && *prompt) fputs(prompt, stdout);
+                    fputs(buf, stdout);
+                    fputc('\n', stdout);
+                    fflush(stdout);
+                    free(working);
+#ifndef _WIN32
+                    if (raw_active) shell_disable_raw_mode();
+#endif
+                    return buf;
+                } else if (sk == SHELL_KEY_CTRL_C || sk == '\033') {
+                    fputs("\r                                                                               \r", stdout);
+                    if (prompt && *prompt) fputs(prompt, stdout);
+                    fputs(buf, stdout);
+                    for (size_t i = pos; i < len; i++) fputc('\b', stdout);
+                    fflush(stdout);
+                    break;
+                } else if (sk >= 32 && sk < 127 && tlen + 1 < sizeof(term)) {
+                    term[tlen++] = (char)sk;
+                    term[tlen] = '\0';
+                    matched_idx = -1;
+                    for (int h = g_history_count - 1; h >= 0; h--) {
+                        if (str_contains_nocase(g_history[h], term)) {
+                            matched_idx = h;
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_BACKSPACE) {
+            if (pos > 0) {
+                if (pos == len) {
+                    pos--;
+                    len--;
+                    buf[len] = '\0';
+                    fputs("\b \b", stdout);
+                    fflush(stdout);
+                } else {
+                    pos--;
+                    memmove(buf + pos, buf + pos + 1, len - pos);
+                    len--;
+                    fputc('\b', stdout);
+                    for (size_t i = pos; i < len; i++) fputc(buf[i], stdout);
+                    fputc(' ', stdout);
+                    for (size_t i = pos; i <= len; i++) fputc('\b', stdout);
+                    fflush(stdout);
+                }
+            }
+            continue;
+        }
+        if (k == SHELL_KEY_TAB || k == '\t') {
+            size_t wstart = pos;
+            while (wstart > 0 && (is_identifier_start(buf[wstart - 1]) ||
+                                  is_ascii_digit(buf[wstart - 1]) ||
+                                  buf[wstart - 1] == '_' ||
+                                  buf[wstart - 1] == '.')) {
+                wstart--;
+            }
+            size_t wlen = pos - wstart;
+            if (wlen > 0) {
+                char prefix[MAX_NAME_LEN];
+                if (wlen < sizeof(prefix)) {
+                    memcpy(prefix, buf + wstart, wlen);
+                    prefix[wlen] = '\0';
+                    static const char* const kws[] = {
+                        "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
+                        "DELETE", "CREATE", "TABLE", "DROP", "ALTER", "ADD", "COLUMN", "INDEX",
+                        "DATABASE", "DATABASES", "SHOW", "TABLES", "USERS", "DESCRIBE", "DESC", "BROWSE",
+                        "EXPLAIN", "STATUS", "HELP", "COMMIT", "ROLLBACK", "BEGIN", "EXIT", "QUIT",
+                        "IMPORT", "EXPORT", "BACKUP", "RESTORE", "FORMAT", "BOX", "MARKDOWN", "TSV",
+                        "JSON", "CSV", "AUTOCOMMIT", "CLEAR", "DISCONNECT", "GUIDE", "ANALYZE", "DRYRUN", "TEST",
+                        "LIMIT", "OFFSET", "ORDER", "BY", "GROUP", "HAVING", "JOIN", "LEFT", "RIGHT",
+                        "INNER", "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE",
+                        "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "VECTOR", "KNN_COSINE", "KNN_L2",
+                        ".help", ".tables", ".schema", ".mode", ".pager", ".backup", ".restore",
+                        ".import", ".export", ".dump", ".open", ".databases", ".users", ".status",
+                        ".selftest", ".quit", ".exit"
+                    };
+                    const char* matches[128];
+                    int match_count = 0;
+                    for (size_t i = 0; i < sizeof(kws) / sizeof(kws[0]); i++) {
+                        bool prefix_match = true;
+                        for (size_t c = 0; c < wlen; c++) {
+                            if (uppercase_ascii(kws[i][c]) != uppercase_ascii(prefix[c])) {
+                                prefix_match = false;
+                                break;
+                            }
+                        }
+                        if (prefix_match && match_count < 128) {
+                            matches[match_count++] = kws[i];
+                        }
+                    }
+                    if (g_db) {
+                        for (int t = 0; t < g_db->table_count; t++) {
+                            bool prefix_match = true;
+                            for (size_t c = 0; c < wlen; c++) {
+                                if (uppercase_ascii(g_db->tables[t].name[c]) != uppercase_ascii(prefix[c])) {
+                                    prefix_match = false;
+                                    break;
+                                }
+                            }
+                            if (prefix_match && match_count < 128) {
+                                matches[match_count++] = g_db->tables[t].name;
+                            }
+                            for (int col = 0; col < g_db->tables[t].col_count; col++) {
+                                const char* colname = g_db->tables[t].columns[col].name;
+                                bool col_match = true;
+                                for (size_t c = 0; c < wlen; c++) {
+                                    if (uppercase_ascii(colname[c]) != uppercase_ascii(prefix[c])) {
+                                        col_match = false;
+                                        break;
+                                    }
+                                }
+                                if (col_match && match_count < 128) {
+                                    bool dup = false;
+                                    for (int m = 0; m < match_count; m++) {
+                                        if (!strcmp(matches[m], colname)) { dup = true; break; }
+                                    }
+                                    if (!dup) matches[match_count++] = colname;
+                                }
+                            }
+                        }
+                    }
+                    if (match_count == 1) {
+                        const char* match = matches[0];
+                        size_t mlen = strlen(match);
+                        for (size_t i = wlen; i < mlen; i++) {
+                            if (len + 1 < max_len) {
+                                buf[pos++] = match[i];
+                                len++;
+                                fputc(match[i], stdout);
+                            }
+                        }
+                        if (len + 1 < max_len) {
+                            buf[pos++] = ' ';
+                            len++;
+                            fputc(' ', stdout);
+                        }
+                        buf[len] = '\0';
+                        fflush(stdout);
+                    } else if (match_count > 1) {
+                        size_t lcp_len = strlen(matches[0]);
+                        for (int m = 1; m < match_count; m++) {
+                            size_t k_idx = 0;
+                            while (k_idx < lcp_len && matches[m][k_idx] &&
+                                   (uppercase_ascii(matches[0][k_idx]) == uppercase_ascii(matches[m][k_idx]))) {
+                                k_idx++;
+                            }
+                            lcp_len = k_idx;
+                        }
+                        if (lcp_len > wlen) {
+                            for (size_t i = wlen; i < lcp_len; i++) {
+                                if (len + 1 < max_len) {
+                                    buf[pos++] = matches[0][i];
+                                    len++;
+                                    fputc(matches[0][i], stdout);
+                                }
+                            }
+                            buf[len] = '\0';
+                            fflush(stdout);
+                        }
+                        fputc('\n', stdout);
+                        for (int m = 0; m < match_count; m++) {
+                            shell_printf("  %-18s%s", matches[m], (m % 4 == 3 || m + 1 == match_count) ? "\n" : "");
+                        }
+                        if (prompt && *prompt) fputs(prompt, stdout);
+                        fputs(buf, stdout);
+                        for (size_t i = pos; i < len; i++) fputc('\b', stdout);
+                        fflush(stdout);
+                    }
+                }
+            }
+            continue;
+        }
+        if ((unsigned char)k >= 32 && (unsigned char)k < 127 && len + 1 < max_len) {
+            if (pos == len) {
+                buf[pos++] = (char)k;
+                len++;
+                buf[len] = '\0';
+                fputc(k, stdout);
+                fflush(stdout);
+            } else {
+                memmove(buf + pos + 1, buf + pos, len - pos + 1);
+                buf[pos++] = (char)k;
+                len++;
+                for (size_t i = pos - 1; i < len; i++) fputc(buf[i], stdout);
+                for (size_t i = pos; i < len; i++) fputc('\b', stdout);
+                fflush(stdout);
+            }
+        }
+    }
+}
+
 
 static void print_quick_start_help(void) {
     shell_puts("================================================================================");
@@ -179,6 +1048,11 @@ static void print_quick_start_help(void) {
           "  LEARN MORE\n"
           "    HELP SELECT;                        Query examples\n"
           "    HELP CREATE;                        Table and database creation\n"
+          "    HELP DDL;                           Schema evolution and ALTER TABLE\n"
+          "    HELP META;                          Meta-commands (\\dt, \\d, .mode)\n"
+          "    HELP SET;                           Session options and formatting\n"
+          "    HELP SAFETY;                        Dry-run impact preview and safe mode\n"
+          "    HELP CLI;                           Command-line launch flags\n"
           "    HELP IMPORT;                        Guided spreadsheet import\n"
           "    HELP SECURITY;                      Safe account and role guidance\n"
           "    HELP BACKUP;                        Backup and restore workflow\n"
@@ -218,7 +1092,7 @@ static const HelpTopic HELP_TOPICS[] = {
      "  SELECT * FROM table ORDER BY col;     Sort results\n"
      "  SELECT COUNT(*) FROM table;           Count rows\n"
      "  SELECT * FROM t1 JOIN t2 ON t1.id = t2.id;  Join tables"},
-    {"CREATE", "TABLE,WIZARD,DDL",
+    {"CREATE", "TABLE,WIZARD,NEW",
      "CREATE — Make databases and tables\n"
      "  CREATE WIZARD;                        Interactive table builder (no SQL needed)\n"
      "  CREATE DATABASE 'file.pcod';          New database\n"
@@ -234,6 +1108,12 @@ static const HelpTopic HELP_TOPICS[] = {
      "  SAVEPOINT name;                       Mark a point to undo to\n"
      "  ROLLBACK TO name;                     Undo back to that point\n"
      "  SET AUTOCOMMIT ON;                    Save after every statement"},
+    {"SAFETY", "DRYRUN,TEST,CONFIRM,SAFETY,DESTRUCTIVE",
+     "SAFETY & IMPACT PREVIEW — Protect and test changes before executing\n"
+     "  SET CONFIRM ON | OFF;                 Prompt before DROP, TRUNCATE, or unconditional DELETE\n"
+     "  DRYRUN DROP TABLE users;              Preview table deletion impact (rows, indexes, FKs, bytes)\n"
+     "  TEST DELETE FROM orders;              Simulate row deletion without modifying database file\n"
+     "  TEST DROP DATABASE 'mydata.pcod';     Inspect database file before deleting"},
     {"VECTORS", "VECTOR,AI,EMBEDDING,SEARCH,SIMILARITY",
      "VECTORS — AI / semantic search\n"
      "  CREATE TABLE docs (id NUMBER PRIMARY KEY, embedding VECTOR(3));\n"
@@ -285,7 +1165,72 @@ static const HelpTopic HELP_TOPICS[] = {
      "  CONNECTION STATUS;\n"
      "  Shows whether the service/database are available, the current user,\n"
      "  whether the connection uses TLS, and storage/backup health.\n"
-     "  Plain network mode is restricted to loopback and is not encrypted."}
+     "  Plain network mode is restricted to loopback and is not encrypted."},
+    {"META", "DOT,SLASH,SHORTCUT,SHORTCUTS",
+     "META-COMMANDS & CLI SHORTCUTS (PostgreSQL & SQLite style)\n"
+     "  \\dt | .tables                         List all tables, column counts, and row counts\n"
+     "  \\d [<t>] | .schema [<t>]              Show CREATE TABLE DDL for table or database\n"
+     "  \\l                                    List .pcod database files in current directory\n"
+     "  \\du                                   List database users and roles (alias for SHOW USERS)\n"
+     "  \\i '<file>' | .read '<file>'          Execute SQL statements from a file\n"
+     "  \\x                                    Toggle expanded vertical row display\n"
+     "  .mode <format>                        Set format: box, markdown, vertical, tsv, json, csv, table\n"
+     "  .mode pager on | off                  Toggle interactive query results pager\n"
+     "  .pager [on | off]                     Show or toggle results pager\n"
+     "  \\c | CANCEL                           Abort current multi-line query buffer\n"
+     "  \\q | .exit | EXIT | QUIT              Exit the shell session"},
+    {"SHELL", "LINE,EDITING,HISTORY,COMPLETION,PAGER,SHORTCUTS,SEARCH",
+     "INTERACTIVE SHELL & NAVIGATION SHORTCUTS\n"
+     "  Up / Down Arrow                       Navigate command history\n"
+     "  Left / Right / Home / End             Move cursor within current line\n"
+     "  Delete / Backspace                    Delete characters under/before cursor\n"
+     "  Tab                                   Auto-complete keywords, tables, columns, and dot-commands\n"
+     "  Tab (multi-match)                     Display formatted grid of matching candidates\n"
+     "  Ctrl+R                                Interactive reverse history search (type to search)\n"
+     "  Ctrl+C                                Cancel current line without executing\n"
+     "  Ctrl+D                                Exit shell (on empty prompt)\n"
+     "  Enter (on empty continuation line)    Execute buffered multi-line query immediately"},
+    {"SET", "CONFIG,FORMAT,OPTIONS,SETTINGS",
+     "SET & CONFIGURATION OPTIONS\n"
+     "  SET AUTOCOMMIT ON | OFF;              Toggle automatic commit after mutations\n"
+     "  SET CONFIRM ON | OFF;                 Prompt before DROP, TRUNCATE, or unconditional DELETE\n"
+     "  SET SAFE_MODE ON | OFF;               Alias for SET CONFIRM\n"
+     "  SET FORMAT BOX|MARKDOWN|VERTICAL|TSV|JSON|CSV|TABLE;\n"
+     "                                        Set result display formatting\n"
+     "  SET NULL '<string>';                  Set display text for NULL values\n"
+     "  SET MAXROWS <n>;                      Cap query result rows (0 = unlimited)\n"
+     "  SET SEMICOLON OPTIONAL ON | OFF;      Execute single-line statements on Enter\n"
+     "  SET TIMING ON | OFF;                  Display query execution duration in microseconds"},
+    {"DDL", "ALTER,SCHEMA,TABLE,CTAS,MODIFY,DROP",
+     "DATA DEFINITION & SCHEMA EVOLUTION\n"
+     "  CREATE TABLE [IF NOT EXISTS] t (id NUMBER PRIMARY KEY, name VARCHAR2(50));\n"
+     "  CREATE TABLE t_copy AS SELECT * FROM t WHERE id < 100;\n"
+     "  CREATE INDEX [IF NOT EXISTS] idx ON t(name);\n"
+     "  ALTER TABLE t ADD [COLUMN] email VARCHAR2(100);\n"
+     "  ALTER TABLE t DROP [COLUMN] email;\n"
+     "  ALTER TABLE t MODIFY [COLUMN] name VARCHAR2(100);\n"
+     "  ALTER TABLE t RENAME TO t_new;\n"
+     "  ALTER TABLE t ADD CONSTRAINT fk_d FOREIGN KEY (dept_id) REFERENCES dept(id);\n"
+     "  ALTER TABLE t DROP CONSTRAINT fk_d;\n"
+     "  DROP TABLE [IF EXISTS] t;\n"
+     "  DROP INDEX idx;\n"
+     "  TRUNCATE TABLE t;"},
+    {"CLI", "STARTUP,FLAGS,OPTIONS,ARGUMENTS",
+     "COMMAND-LINE STARTUP FLAGS\n"
+     "  opendata [<file.pcod>] [\"<sql>\"]       Open database and optionally run query\n"
+     "  opendata -e \"<sql>\"                    Execute query and exit immediately\n"
+     "  opendata -f <table|csv|json>          Output format for query results\n"
+     "  opendata --dev                        Instant dev server on 127.0.0.1:7350 (dev.pcod)\n"
+     "  opendata -s, --server                 Start TCP server on loopback\n"
+     "  opendata --tcps --port 7338           Start TLS server\n"
+     "  opendata --backup-dir <dir>           Directory for automated/manual backups\n"
+     "  opendata --backup-interval <sec>      Automated backup interval in seconds\n"
+     "  opendata --restore <backup-file>      Restore database snapshot from backup\n"
+     "  opendata --readonly                   Open database in read-only mode\n"
+     "  opendata --check-config               Validate configuration file syntax\n"
+     "  opendata --ping                       Ping running server instance\n"
+     "  opendata -v, --version                Display version\n"
+     "  opendata -h, --help                   Display reference guide"}
 };
 
 static bool contains_case_insensitive(const char* haystack, const char* needle) {
@@ -315,7 +1260,14 @@ static bool help_name_matches(const HelpTopic* topic_entry, const char* word) {
 
 static void print_topic_help(const char* topic) {
     const size_t count = sizeof(HELP_TOPICS) / sizeof(HELP_TOPICS[0]);
-    /* 1. Exact match on topic name or alias. */
+    /* 1. Exact match on topic name. */
+    for (size_t i = 0; i < count; i++) {
+        if (!strcmp(HELP_TOPICS[i].name, topic)) {
+            shell_puts(HELP_TOPICS[i].body);
+            return;
+        }
+    }
+    /* 2. Match on alias. */
     for (size_t i = 0; i < count; i++) {
         if (help_name_matches(&HELP_TOPICS[i], topic)) {
             shell_puts(HELP_TOPICS[i].body);
@@ -356,51 +1308,118 @@ static void print_topic_help(const char* topic) {
 void print_command_help(void) {
     print_quick_start_help();
     shell_puts("");
-    shell_puts("NETWORK SERVER: --database <file> --tcps [--bind <IPv4>] [--port <port>] [--wallet <directory>]\n"
-               "  --inspect-wallet <directory> validates and reports wallet configuration.\n"
-               "  First startup without accounts: set OPENDATA_SERVER_USER and\n"
-               "  OPENDATA_SERVER_PASSWORD (16-255 bytes) to bootstrap an administrator.\n"
-#ifdef _WIN32
-               "  Windows Schannel TLS: --cert store:<thumbprint> (CurrentUser\\My); omit --key.\n"
-#else
-               "  OS TLS library: --cert <PEM-chain> --key <PEM-private-key>.\n"
-#endif
-               "  Plain --server is authenticated and restricted to IPv4 loopback.\n");
     shell_puts("================================================================================");
     shell_puts("                    PC/OpenData SQL Interactive Shell " SERVER_VERSION);
     shell_puts("================================================================================\n"
-          "  CONNECTION & DATABASE LIFECYCLE\n"
+          "  COMMAND-LINE LAUNCH OPTIONS\n"
+          "    opendata [<file.pcod>] [\"<sql>\"]   Connect database and optionally run query\n"
+          "    opendata -e, --execute \"<sql>\"     Run SQL non-interactively and exit\n"
+          "    opendata -f, --format <fmt>        Result format: table, csv, json\n"
+          "    opendata --dev                     Local dev server on 127.0.0.1:7350 (dev.pcod)\n"
+          "    opendata -s, --server              Start TCP server on 127.0.0.1\n"
+          "    opendata --tcps                    Start TLS encrypted server\n"
+          "    opendata -p, --port <port>         Server port (default: 7350 TCP, 7338 TLS)\n"
+          "    opendata --bind <IPv4>             Server bind IP address (default: 127.0.0.1)\n"
+          "    opendata --database <file>         Database snapshot path\n"
+          "    opendata --backup-dir <dir>        Directory for background/instant backups\n"
+          "    opendata --backup-interval <sec>   Automated backup interval (1-86400 seconds)\n"
+          "    opendata --restore <backup>        Restore snapshot into target database\n"
+          "    opendata --pitr <timestamp>        Point-in-time recovery to Unix timestamp\n"
+#ifdef _WIN32
+          "    opendata --install-service [name]  Register Windows background service\n"
+          "    opendata --uninstall-service [name] Remove Windows background service\n"
+          "    opendata --start-service [name]    Start installed Windows service\n"
+          "    opendata --stop-service [name]     Stop running Windows service\n"
+#endif
+          "    opendata --ad-server <host>        Active Directory domain controller host/IP\n"
+          "    opendata --ad-domain <domain>      Active Directory domain name (e.g. corp.local)\n"
+          "    opendata --ad-admin-group <grp>    AD security group mapped to ADMIN role\n"
+          "    opendata --ldap-server <host>      LDAP server hostname or IP address\n"
+          "    opendata --ldap-port <port>        LDAP server port (default: 389, or 636 for SSL)\n"
+          "    opendata --ldap-ssl                Enable LDAPS / SSL encryption\n"
+          "    opendata --ldap-base-dn <dn>       LDAP search base DN (e.g. ou=users,dc=org)\n"
+          "    opendata --ldap-admin-group <grp>  LDAP admin group name/DN for ADMIN role\n"
+          "    opendata --krb-realm <realm>       Kerberos / GSSAPI authentication realm\n"
+          "    opendata --krb-service <service>   Kerberos service principal name (default: opendata)\n"
+          "    opendata --krb-keytab <path>       Kerberos keytab file path\n"
+          "    opendata --statement-timeout <ms>  Maximum statement execution time limit in milliseconds\n"
+          "    opendata --auto-vacuum             Enable automatic background table compaction\n"
+          "    opendata --no-auto-vacuum          Disable automatic background table compaction\n"
+          "    opendata --readonly                Open database in read-only mode\n"
+          "    opendata --no-default-db           Do not auto-open default database\n"
+          "    opendata --check-config            Validate configuration file syntax and exit\n"
+          "    opendata --wallet <dir>            Directory with TLS certificates and config\n"
+          "    opendata --inspect-wallet <dir>    Inspect and validate TLS wallet configuration\n"
+#ifdef _WIN32
+          "    opendata --cert store:<thumb>      Schannel TLS certificate (CurrentUser\\My)\n"
+#else
+          "    opendata --cert <PEM-chain>        TLS certificate chain PEM file\n"
+          "    opendata --key <PEM-key>           TLS private key PEM file\n"
+#endif
+          "    opendata --cluster-node <id>       Raft cluster node ID\n"
+          "    opendata --cluster-port <port>     Raft cluster consensus port\n"
+          "    opendata --cluster-peers <list>    Comma-separated peer addresses (node@ip:port)\n"
+          "    opendata --cluster-ca <path>       CA certificate for inter-node mutual TLS\n"
+          "    opendata --sync-replication        Enable synchronous cluster replication\n"
+          "    opendata --cluster-follower        Join Raft cluster as follower node\n"
+          "    opendata --ping                    Health-check running server instance\n"
+          "    opendata self-test [suite]         Run built-in enterprise self-test suite\n"
+          "    opendata -v, --version             Display version information\n"
+          "    opendata -h, --help                Display this reference guide\n");
+
+    shell_puts("  CONNECTION & DATABASE LIFECYCLE\n"
           "    CREATE DATABASE '<path>' [BACKUP '<dir>'] [INTERVAL <sec>]\n"
           "                                  Initialize and connect to a new empty database\n"
           "    CONNECT '<path>' [BACKUP '<dir>'] [INTERVAL <sec>] [READONLY]\n"
-          "                                  Open or create a database instance\n"
+          "                                  Open or create a database instance (aliases: USE, OPEN)\n"
           "    DISCONNECT                    Close active database snapshot and release locks\n"
           "    DROP DATABASE '<path>'        Permanently delete a database snapshot file\n"
           "    SHOW DATABASES                List .pcod database files in working directory\n"
           "    \\c | CANCEL                   Clear/abort current multi-line query buffer\n"
           "    STATUS                        Display database health, generation, and metrics\n"
-          "    SUPPORT REPORT TO '<file>'   Write a privacy-preserving support summary\n"
+          "    CONNECTION STATUS             Show connection transport, TLS state, and user\n"
+          "    SUPPORT REPORT TO '<file>'    Write a privacy-preserving support summary\n"
           "    CLEAR | CLS                   Clear terminal screen\n"
-          "    HELP                          Display this reference guide\n"
-          "    EXIT | QUIT                   Exit shell session (discards uncommitted work)\n\n"
-          "  IRIS INTERNAL TEXT EDITOR (GNU NANO-STYLED)\n"
+          "    PING                          Check server responsiveness\n"
+          "    GUIDE                         Interactive task guide and next commands\n"
+          "    HELP [<topic>]                Display full reference or topic help\n"
+          "    EXIT | QUIT                   Exit shell session (discards uncommitted work)\n");
+
+    shell_puts("  META-COMMANDS & CLI SHORTCUTS (POSTGRESQL & SQLITE STYLE)\n"
+          "    \\dt | .tables                 List all user tables, column counts, and row counts\n"
+          "    \\d [<t>] | .schema [<t>]      Display CREATE TABLE DDL for table or all tables\n"
+          "    \\l                            List available .pcod database files in current directory\n"
+          "    \\du                           List database users and roles (alias for SHOW USERS)\n"
+          "    \\i '<file>' | .read '<file>'  Execute SQL commands from an external script file\n"
+          "    \\x                            Toggle expanded vertical result display on/off\n"
+          "    .mode <fmt>                   Set result format: box, markdown, vertical, tsv, json, csv, table\n"
+          "    \\q | .exit                    Exit shell session\n"
+          "    @<script.sql>                 Alias for SOURCE '<script.sql>'\n");
+
+    shell_puts("  IRIS INTERNAL TEXT EDITOR (GNU NANO-STYLED)\n"
           "    IRIS ['<file>']               Launch IRIS editor on SQL buffer or target file\n"
           "    EDIT ['<file>'] | ED ['<file>']\n"
           "                                  Aliases to invoke the IRIS text editor\n"
           "    Shortcuts: ^G Help  ^O WriteOut  ^R ReadFile  ^W WhereIs  ^K Cut  ^U UnCut\n"
-          "               ^J Justify SQL  ^C CurPos  ^T Execute SQL  ^X Exit\n\n"
-          "  SCRIPTING, SPOOLING & SESSION ERGONOMICS\n"
+          "               ^J Justify SQL  ^C CurPos  ^T Execute SQL  ^X Exit\n");
+
+    shell_puts("  SCRIPTING, SPOOLING, CONFIG & SAFETY\n"
           "    SOURCE '<script.sql>' | @<script.sql>\n"
           "                                  Execute batch SQL statements from a file\n"
           "    SPOOL '<output.txt>' | SPOOL OFF\n"
           "                                  Mirror all shell and query output to a transcript\n"
           "    HISTORY                       Display numbered session command history\n"
           "    SET AUTOCOMMIT ON | OFF       Toggle automatic durable commit after mutations\n"
-          "    SET FORMAT TABLE | JSON | CSV Output formatting mode for query results\n"
+          "    SET CONFIRM ON | OFF          Toggle confirmation prompt for destructive statements\n"
+          "    SET SAFE_MODE ON | OFF        Alias for SET CONFIRM\n"
+          "    DRYRUN | TEST <statement>     Simulate statement and preview impact without modifying data\n"
+          "    SET FORMAT BOX|MARKDOWN|VERTICAL|TSV|JSON|CSV|TABLE\n"
+          "                                  Output formatting mode for query results\n"
           "    SET NULL '<text>'             Set custom display string for NULL values\n"
-          "    SET MAXROWS <n>               Cap default maximum rows returned by SELECT\n"
+          "    SET MAXROWS <n>               Cap maximum rows returned by SELECT (0 = unlimited)\n"
           "    SET SEMICOLON OPTIONAL ON|OFF Run complete single-line statements on Enter\n"
           "    SET TIMING ON | OFF           Toggle microsecond query execution timer\n");
+
     shell_puts("  DATABASE USER ADMINISTRATION\n"
           "    GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON <t> TO '<user>'\n"
           "                                  Grant per-table privileges to a READ_ONLY user\n"
@@ -421,7 +1440,8 @@ void print_command_help(void) {
           "    Passwords: 16-255 bytes. Names: 1-63 printable ASCII bytes, no spaces/quotes.\n"
           "    The last enabled administrator cannot be dropped, disabled, or demoted.\n"
           "    Existing connections are rechecked on their next request after COMMIT.\n"
-          "    Keep passwords out of command-line arguments and spooled transcripts.\n\n");
+          "    Keep passwords out of command-line arguments and spooled transcripts.\n");
+
     shell_puts("  SCHEMA INTROSPECTION, OBSERVABILITY & DIAGNOSTICS\n"
           "    DESCRIBE | DESC <t>           Display column names, types, keys, and references\n"
           "    SHOW TABLES                   List all registered tables and row counts\n"
@@ -432,6 +1452,7 @@ void print_command_help(void) {
           "    SHOW CONSTRAINTS [FROM <t>]   List PK, UNIQUE, NOT NULL, and FK actions\n"
           "    SHOW STATS [FOR <t>]          Display CBO statistics, sample rows, and bounds\n"
           "    SHOW ENGINE STATUS            Display storage engine memory, buffer pool & metrics\n"
+          "    SHOW METRICS                  Display database engine performance counters\n"
           "    SHOW SESSIONS | SHOW PROCESSLIST\n"
           "                                  List active client sessions and current queries\n"
           "    KILL [SESSION] <id>           Terminate an active client session by ID\n"
@@ -446,23 +1467,47 @@ void print_command_help(void) {
           "    SHOW CLUSTER                  Display Raft consensus role, peers, and WAL state\n"
           "    SHOW USER                     Display active session identity\n"
           "    CHECK INTEGRITY               Verify relational invariants and snapshot health\n"
+          "    SELF-TEST [suite]             Run built-in 13-suite enterprise self-test module\n"
+          "    VERIFY BACKUP '<file>'        Offline restorability check of a backup snapshot\n"
+          "    VERIFY AUDIT                  Verify tamper-evident SHA-256 audit log chain\n"
           "    VACUUM | COMPACT              Compact table storage and rewrite clean snapshot\n"
           "    EXPLAIN [QUERY PLAN] <query>  Output query execution plan and CBO cost estimate\n"
-          "    BACKUP                        Trigger immediate verified off-machine backup\n"
-          "    VERIFY BACKUP '<file>'        Offline restorability check of a backup snapshot\n\n"
-          "  TRANSACTION CONTROL, DDL, DML, VECTOR SEARCH & INTEROPERABILITY\n"
+          "    BACKUP                        Trigger immediate verified off-machine backup\n");
+
+    shell_puts("  TRANSACTION CONTROL, DDL, DML, VECTOR SEARCH & DATA INTERCHANGE\n"
           "    BEGIN | COMMIT | ROLLBACK     Explicit atomic transaction control\n"
           "    SAVEPOINT <s>                 Create named rollback savepoint\n"
           "    ROLLBACK TO [SAVEPOINT] <s>   Roll back state to designated savepoint\n"
           "    RELEASE [SAVEPOINT] <s>       Release savepoint marker\n"
-          "    CREATE TABLE <t> (<col> NUMBER|VARCHAR2(n)|DATE|VECTOR(dim) ...)\n"
+          "    CREATE TABLE [IF NOT EXISTS] <t> (<col> NUMBER|VARCHAR2(n)|DATE|VECTOR(dim) ...)\n"
+          "    CREATE TABLE <t> AS SELECT ...\n"
+          "                                  Create new table pre-populated with query results\n"
+          "    CREATE INDEX [IF NOT EXISTS] <name> ON <t> [USING HNSW] (<col>)\n"
+          "                                  Create secondary B+ tree or HNSW vector index\n"
+          "    ALTER TABLE <t> ADD [COLUMN] <col> <type>\n"
+          "                                  Add column to existing table\n"
+          "    ALTER TABLE <t> DROP [COLUMN] <col>\n"
+          "                                  Drop column from existing table\n"
+          "    ALTER TABLE <t> MODIFY [COLUMN] <col> <type>\n"
+          "                                  Change column data type or expand length\n"
+          "    ALTER TABLE <t> RENAME TO <new_name>\n"
+          "                                  Rename table\n"
           "    ALTER TABLE <t> ADD|DROP CONSTRAINT <name> PRIMARY KEY|UNIQUE|FOREIGN KEY ...\n"
+          "    DROP TABLE [IF EXISTS] <t>    Drop table and all associated indexes\n"
+          "    DROP INDEX <name>             Drop secondary B+ tree index\n"
+          "    TRUNCATE TABLE <t>            Remove all rows while preserving table schema\n"
+          "    INSERT INTO <t> [(<cols>)] VALUES (...)\n"
+          "    INSERT INTO <t> [(<cols>)] SELECT ...\n"
           "    INSERT INTO <t> VALUES (...) ON CONFLICT [(<c>)] DO NOTHING | DO UPDATE SET ...\n"
-          "    VECTOR OPERATORS: <=> (Cosine Distance), <-> (L2 Distance),\n"
+          "    UPDATE <t> SET <col>=<val> [WHERE <condition>]\n"
+          "    DELETE FROM <t> [WHERE <condition>]\n"
+          "    WINDOW & JSON FUNCTIONS:      ROW_NUMBER(), RANK(), DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...),\n"
+          "                                  JSON_EXTRACT(col, 'path'), JSON_VALUE(col, 'path'), col->'path', col->>'path'\n"
+          "    VECTOR OPERATORS & HNSW:      <=> (Cosine Distance), <-> (L2 Distance), USING HNSW\n"
           "                      COSINE_DISTANCE(col, '[...]'), L2_DISTANCE(col, '[...]')\n"
-          "    IMPORT WIZARD                  Guided CSV preview, mapping, and import\n"
-          "    CREATE WIZARD                  Interactive table builder (no SQL needed)\n"
-          "    LOAD SAMPLE                    Load the SAMPLE_DATA practice table\n"
+          "    IMPORT WIZARD                 Guided CSV preview, mapping, and import\n"
+          "    CREATE WIZARD                 Interactive table builder (no SQL needed)\n"
+          "    LOAD SAMPLE                   Load the SAMPLE_DATA practice table\n"
           "    IMPORT TABLE <t> FROM CSV|JSON|MSSQL|ORACLE '<file>' [HEADER]\n"
           "    EXPORT TABLE <t> TO CSV|JSON|MSSQL|ORACLE '<file>'\n"
           "    IMPORT MSSQL|ORACLE [INTO <t>] FROM '<file>'\n"
@@ -473,6 +1518,7 @@ void print_command_help(void) {
 static bool parse_path_arg(Parser* p, char* out_path, size_t cap) {
     out_path[0] = '\0';
     if (p->kind == TK_STRING) {
+        if (strlen(p->text) >= cap) return false;
         snprintf(out_path, cap, "%s", p->text);
         scan_next_token(p);
         return out_path[0] != '\0';
@@ -487,6 +1533,8 @@ static bool parse_path_arg(Parser* p, char* out_path, size_t cap) {
                 memcpy(out_path + len, p->text, tlen);
                 len += tlen;
                 out_path[len] = '\0';
+            } else {
+                return false;
             }
             scan_next_token(p);
         }
@@ -787,6 +1835,9 @@ static bool load_sample_data(void) {
 }
 
 static bool execute_connect_statement(Parser* p) {
+    if (g_network_user[0]) {
+        return report_database_error("CONNECT is disabled for network sessions");
+    }
     char db_path[PATH_CAP] = {0};
     char backup_dir[PATH_CAP] = {0};
     char restore_path[PATH_CAP] = {0};
@@ -849,6 +1900,9 @@ static bool execute_connect_statement(Parser* p) {
 }
 
 static bool execute_create_database_statement(Parser* p) {
+    if (g_network_user[0]) {
+        return report_database_error("CREATE DATABASE is disabled for network sessions");
+    }
     char db_path[PATH_CAP] = {0};
     char backup_dir[PATH_CAP] = {0};
     unsigned interval = 0;
@@ -901,6 +1955,9 @@ static bool execute_create_database_statement(Parser* p) {
 
 static bool execute_drop_database_statement(Parser* p) {
     if (g_readonly) return report_database_error("cannot DROP DATABASE in read-only mode");
+    if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+        return report_database_error("permission denied: DROP DATABASE requires the ADMIN role");
+    }
     char db_path[PATH_CAP] = {0};
     if (!parse_path_arg(p, db_path, sizeof(db_path)) || !consume_statement_end(p)) {
         return report_database_error("expected database file path for DROP DATABASE");
@@ -913,7 +1970,10 @@ static bool execute_drop_database_statement(Parser* p) {
         return report_database_error("database file does not exist: %s", resolved);
     }
     ConfirmationResult confirmation = confirm_destructive_action(
-        "This permanently deletes the database file and its contents.", "DELETE DATABASE");
+        "DROP DATABASE", resolved, "This permanently deletes the database file and its contents from disk.", "DROP");
+    if (confirmation == CONFIRM_DRYRUN) {
+        handle_confirmation_with_dryrun(&confirmation, "DROP DATABASE", resolved, "All tables, snapshots, and data files will be deleted.");
+    }
     if (!allow_or_report_confirmation(confirmation)) return confirmation == CONFIRM_CANCEL;
     /* Only delete files that are actually PC/OpenData database snapshots. */
     {
@@ -945,6 +2005,9 @@ static bool execute_drop_database_statement(Parser* p) {
 }
 
 static bool execute_disconnect_statement(Parser* p) {
+    if (g_network_user[0]) {
+        return report_database_error("DISCONNECT is disabled for network sessions");
+    }
     if (!consume_statement_end(p)) return false;
     if (!g_db) {
         shell_puts("No active database connection.");
@@ -1023,6 +2086,9 @@ static bool execute_source_file_impl(const char* filepath, bool* quit) {
 }
 
 static bool execute_source_file(const char* filepath, bool* quit) {
+    if (g_network_user[0]) {
+        return report_database_error("script execution is disabled for network sessions");
+    }
     static unsigned depth = 0;
     if (depth >= 16) return report_database_error("SOURCE nesting limit exceeded");
     depth++;
@@ -1035,6 +2101,9 @@ static bool execute_source_file(const char* filepath, bool* quit) {
 }
 
 static bool execute_spool_statement(Parser* p) {
+    if (g_network_user[0]) {
+        return report_database_error("SPOOL is disabled for network sessions");
+    }
     if (consume_keyword(p, "OFF")) {
         if (!consume_statement_end(p)) return false;
         if (!g_spool_file) {
@@ -1138,7 +2207,7 @@ static void print_table_ddl(const Table* t) {
     shell_puts(";");
 }
 
-static bool is_supported_db_filename(const char* name) {
+bool is_supported_db_filename(const char* name) {
     size_t len = strlen(name);
     static const char* exts[] = { ".pcod", ".mdf", ".ndf", ".bak", ".dbf", ".ora", ".dmp" };
     for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
@@ -1210,7 +2279,7 @@ static void show_databases_in_dir(void) {
                 if (g_db && resolve_absolute_path(fd.cFileName, abs_p) && !strcmp(abs_p, g_path)) {
                     is_active = true;
                 }
-                shell_printf("%s\t%llu\t%s\n", fd.cFileName, sz, is_active ? "CONNECTED" : "AVAILABLE");
+                char sz_str[32]; format_human_size(sz, sz_str, sizeof(sz_str)); shell_printf("%s\t%s\t%s\n", fd.cFileName, sz_str, is_active ? "CONNECTED" : "AVAILABLE");
                 count++;
             }
         } while (FindNextFileA(h, &fd));
@@ -1500,12 +2569,117 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
         }
         scan_next_token(&history_parser);
     }
-    if (!sensitive_user_command) record_history(text);
+    if (!sensitive_user_command) record_history_entry(text);
 
-    if (*text == '.') {
-        if (!strncmp(text, ".mode json", 10)) { g_output_format = FORMAT_JSON; shell_puts("format: json"); return true; }
-        if (!strncmp(text, ".mode csv", 9)) { g_output_format = FORMAT_CSV; shell_puts("format: csv"); return true; }
-        if (!strncmp(text, ".mode table", 11)) { g_output_format = FORMAT_TABLE; shell_puts("format: table"); return true; }
+    if (text[0] == '\\' || text[0] == '.') {
+        const char* cmd = text;
+        while (*cmd == ' ' || *cmd == '\t') cmd++;
+        if (!strcmp(cmd, "\\dt") || !strcmp(cmd, ".tables")) {
+            shell_puts("TABLE_NAME\tCOLUMNS\tROWS");
+            shell_puts("DUAL\t1\t1");
+            if (g_db) {
+                for (int t = 0; t < g_db->table_count; t++)
+                    shell_printf("%s\t%d\t%d\n", g_db->tables[t].name, g_db->tables[t].col_count, g_db->tables[t].row_count);
+            }
+            return true;
+        }
+        if (!strncmp(cmd, "\\d", 2) || !strncmp(cmd, ".schema", 7)) {
+            const char* arg = cmd + (cmd[1] == 'd' ? 2 : 7);
+            while (*arg == ' ' || *arg == '\t') arg++;
+            char tbl_name[MAX_NAME_LEN] = {0};
+            size_t ai = 0;
+            while (*arg && !is_sql_whitespace(*arg) && *arg != ';' && ai + 1 < sizeof(tbl_name)) {
+                tbl_name[ai++] = *arg++;
+            }
+            tbl_name[ai] = '\0';
+            if (tbl_name[0]) {
+                if (!g_db) return report_database_error("not connected to any database");
+                int idx = find_table_index(g_db, tbl_name);
+                if (idx < 0) {
+                    report_table_not_found(g_db, tbl_name);
+                    return false;
+                }
+                print_table_ddl(&g_db->tables[idx]);
+            } else {
+                if (!g_db || g_db->table_count == 0) shell_puts("-- No user tables defined.");
+                else {
+                    for (int t = 0; t < g_db->table_count; t++) {
+                        print_table_ddl(&g_db->tables[t]);
+                        if (t + 1 < g_db->table_count) shell_puts("");
+                    }
+                }
+            }
+            return true;
+        }
+        if (!strcmp(cmd, "\\l")) {
+            show_databases_in_dir();
+            return true;
+        }
+        if (!strcmp(cmd, "\\du")) {
+            return execute_console_statement("SHOW USERS;", quit);
+        }
+        if (!strncmp(cmd, "\\i", 2) || !strncmp(cmd, ".read", 5)) {
+            const char* path = cmd + (cmd[1] == 'i' ? 2 : 5);
+            while (*path == ' ' || *path == '\t' || *path == '\'' || *path == '"') path++;
+            char clean_path[PATH_CAP] = {0};
+            size_t pi = 0;
+            while (*path && *path != ';' && *path != '\'' && *path != '"' && pi + 1 < sizeof(clean_path)) {
+                clean_path[pi++] = *path++;
+            }
+            while (pi > 0 && is_sql_whitespace(clean_path[pi - 1])) clean_path[--pi] = '\0';
+            if (!clean_path[0]) return report_database_error("expected file path after script command");
+            return execute_source_file(clean_path, quit);
+        }
+        if (!strcmp(cmd, "\\q") || !strcmp(cmd, ".exit")) {
+            if (g_spool_file) { fclose(g_spool_file); g_spool_file = NULL; }
+            *quit = true;
+            return true;
+        }
+        if (!strcmp(cmd, "\\x")) {
+            static OutputFormat s_prev_format = FORMAT_TABLE;
+            if (g_output_format == FORMAT_VERTICAL) {
+                g_output_format = s_prev_format;
+                shell_puts("Expanded display is off.");
+            } else {
+                s_prev_format = g_output_format;
+                g_output_format = FORMAT_VERTICAL;
+                shell_puts("Expanded display is on.");
+            }
+            return true;
+        }
+        if (!strcmp(cmd, ".mode")) {
+            const char* cur = "table";
+            switch (g_output_format) {
+                case FORMAT_BOX: cur = "box"; break;
+                case FORMAT_MARKDOWN: cur = "markdown"; break;
+                case FORMAT_VERTICAL: cur = "vertical"; break;
+                case FORMAT_TSV: cur = "tsv"; break;
+                case FORMAT_JSON: cur = "json"; break;
+                case FORMAT_CSV: cur = "csv"; break;
+                default: cur = "table"; break;
+            }
+            shell_printf("current mode: %s (available: table, box, markdown, vertical, tsv, json, csv, list | pager: %s)\n", cur, g_pager_enabled ? "on" : "off");
+            return true;
+        }
+        if (!strncmp(cmd, ".mode pager on", 14) || !strcmp(cmd, ".pager on")) { g_pager_enabled = true; shell_puts("pager: on"); return true; }
+        if (!strncmp(cmd, ".mode pager off", 15) || !strcmp(cmd, ".pager off")) { g_pager_enabled = false; shell_puts("pager: off"); return true; }
+        if (!strcmp(cmd, ".pager")) { shell_printf("pager: %s\n", g_pager_enabled ? "on" : "off"); return true; }
+        if (!strncmp(cmd, ".mode list", 10) || !strncmp(cmd, ".mode tabs", 10)) { g_output_format = FORMAT_TSV; shell_puts("format: tsv"); return true; }
+        if (!strncmp(cmd, ".mode box", 9)) { g_output_format = FORMAT_BOX; shell_puts("format: box"); return true; }
+        if (!strncmp(cmd, ".mode markdown", 14) || !strncmp(cmd, ".mode md", 8)) { g_output_format = FORMAT_MARKDOWN; shell_puts("format: markdown"); return true; }
+        if (!strncmp(cmd, ".mode vertical", 14)) { g_output_format = FORMAT_VERTICAL; shell_puts("format: vertical"); return true; }
+        if (!strncmp(cmd, ".mode tsv", 9)) { g_output_format = FORMAT_TSV; shell_puts("format: tsv"); return true; }
+        if (!strncmp(cmd, ".mode json", 10)) { g_output_format = FORMAT_JSON; shell_puts("format: json"); return true; }
+        if (!strncmp(cmd, ".mode csv", 9)) { g_output_format = FORMAT_CSV; shell_puts("format: csv"); return true; }
+        if (!strncmp(cmd, ".mode table", 11)) { g_output_format = FORMAT_TABLE; shell_puts("format: table"); return true; }
+        if (!strncmp(cmd, ".selftest", 9) || !strncmp(cmd, ".self-test", 10)) {
+            const char* arg = cmd + (cmd[5] == '-' ? 10 : 9);
+            while (*arg == ' ' || *arg == '\t') arg++;
+            char filter[64] = {0};
+            size_t fi = 0;
+            while (*arg && !is_sql_whitespace(*arg) && *arg != ';' && fi + 1 < sizeof(filter)) filter[fi++] = *arg++;
+            return execute_self_test(filter[0] ? filter : NULL);
+        }
     }
     if (*text == '@') {
         Parser sp = {0};
@@ -1583,6 +2757,14 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
     } else if (!strcmp(command, "PING")) {
         ok = consume_statement_end(&p);
         if (ok) shell_puts("PONG");
+    } else if (!strcmp(command, "SELFTEST") || !strcmp(command, "SELF_TEST") ||
+               (!strcmp(command, "SELF") && (consume_token(&p, TK_MINUS), consume_keyword(&p, "TEST")))) {
+        char suite_filter[MAX_NAME_LEN] = {0};
+        if (p.kind == TK_ID || p.kind == TK_STRING) {
+            snprintf(suite_filter, sizeof(suite_filter), "%s", p.text);
+            scan_next_token(&p);
+        }
+        ok = consume_statement_end(&p) && execute_self_test(suite_filter[0] ? suite_filter : NULL);
     } else if (!strcmp(command, "SOURCE")) {
         char script_path[PATH_CAP] = {0};
         if (!parse_path_arg(&p, script_path, sizeof(script_path)) || !consume_statement_end(&p)) {
@@ -1599,6 +2781,9 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             }
         }
     } else if (!strcmp(command, "IRIS") || !strcmp(command, "EDIT") || !strcmp(command, "ED")) {
+        if (g_network_user[0]) {
+            return report_database_error("interactive editor is disabled for network sessions");
+        }
         char edit_file[PATH_CAP] = {0};
         if (p.kind != TK_END && p.kind != TK_SEMI) {
             if (!parse_path_arg(&p, edit_file, sizeof(edit_file))) {
@@ -1625,6 +2810,10 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             if (consume_keyword(&p, "JSON")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_JSON; }
             else if (consume_keyword(&p, "CSV")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_CSV; }
             else if (consume_keyword(&p, "TABLE")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_TABLE; }
+            else if (consume_keyword(&p, "BOX")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_BOX; }
+            else if (consume_keyword(&p, "MARKDOWN") || consume_keyword(&p, "MD")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_MARKDOWN; }
+            else if (consume_keyword(&p, "VERTICAL")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_VERTICAL; }
+            else if (consume_keyword(&p, "TSV") || consume_keyword(&p, "LIST") || consume_keyword(&p, "TABS")) { ok = consume_statement_end(&p); if (ok) g_output_format = FORMAT_TSV; }
             else ok = false;
         } else if (consume_keyword(&p, "AUTOCOMMIT")) {
             if (consume_keyword(&p, "ON")) {
@@ -1677,6 +2866,56 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
                     shell_puts("Semicolons are required.");
                 }
             } else ok = false;
+        } else if (consume_keyword(&p, "CONFIRM_DESTRUCTIVE") || consume_keyword(&p, "CONFIRM") || consume_keyword(&p, "SAFE_MODE")) {
+            if (consume_keyword(&p, "ON")) {
+                ok = consume_statement_end(&p);
+                if (ok) {
+                    g_confirm_destructive = true;
+                    shell_puts("Destructive command confirmation is ON.");
+                }
+            } else if (consume_keyword(&p, "OFF")) {
+                ok = consume_statement_end(&p);
+                if (ok) {
+                    g_confirm_destructive = false;
+                    shell_puts("Destructive command confirmation is OFF (prompts disabled).");
+                }
+            } else ok = false;
+        } else if (consume_keyword(&p, "STATEMENT_TIMEOUT")) {
+            consume_token(&p, TK_EQ);
+            if (p.kind == TK_NUMBER) {
+                long to_val = strtol(p.text, NULL, 10);
+                scan_next_token(&p);
+                ok = (to_val >= 0) && consume_statement_end(&p);
+                if (ok) {
+                    g_statement_timeout_ms = (uint32_t)to_val;
+                    shell_printf("STATEMENT_TIMEOUT set to %u ms.\n", g_statement_timeout_ms);
+                }
+            } else ok = false;
+        } else if (consume_keyword(&p, "BUFFER_POOL") || consume_keyword(&p, "BUFFER_POOL_SIZE")) {
+            consume_token(&p, TK_EQ);
+            if (p.kind == TK_NUMBER) {
+                long mb_val = strtol(p.text, NULL, 10);
+                scan_next_token(&p);
+                ok = (mb_val >= 1 && mb_val <= 1048576) && consume_statement_end(&p);
+                if (ok) {
+                    g_buffer_pool_size_mb = (uint32_t)mb_val;
+                    shell_printf("BUFFER_POOL_SIZE set to %u MB.\n", g_buffer_pool_size_mb);
+                }
+            } else ok = false;
+        } else if (consume_keyword(&p, "AUTO_VACUUM") || consume_keyword(&p, "AUTOVACUUM")) {
+            if (consume_keyword(&p, "ON")) {
+                ok = consume_statement_end(&p);
+                if (ok) {
+                    g_autovacuum_enabled = true;
+                    shell_puts("Auto-vacuum is ON.");
+                }
+            } else if (consume_keyword(&p, "OFF")) {
+                ok = consume_statement_end(&p);
+                if (ok) {
+                    g_autovacuum_enabled = false;
+                    shell_puts("Auto-vacuum is OFF.");
+                }
+            } else ok = false;
         } else ok = false;
     } else if (!strcmp(command, "SUPPORT")) {
         ok = execute_support_report(&p);
@@ -1693,9 +2932,10 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
                 shell_printf("Session: %s\n",
                              g_server_mode ? "local server console" : "local shell or embedded API");
             }
-            shell_printf("Database: %s\nGeneration: %llu\nPending: %s\nAutocommit: %s\nStorage health: %s\nBackup interval: %u seconds\nBackup directory: %s\nBackup health: %s\nLast backed-up generation: %llu\nLast completed backup (Unix seconds): %llu\n",
+            shell_printf("Database: %s\nGeneration: %llu\nPending: %s\nAutocommit: %s\nDestructive confirm: %s\nStorage health: %s\nBackup interval: %u seconds\nBackup directory: %s\nBackup health: %s\nLast backed-up generation: %llu\nLast completed backup (Unix seconds): %llu\n",
                     g_path, (unsigned long long)g_generation, g_pending ? "yes" : "no",
                     g_autocommit ? "ON" : "OFF",
+                    g_confirm_destructive ? "ON" : "OFF",
                     g_io_uncertain ? "UNCERTAIN - restart required" : "healthy",
                     g_backup_interval, g_backup_dir, atomic_load(&g_backup_failed) ? "FAILED" : "healthy",
                     atomic_load(&g_backup_generation), atomic_load(&g_backup_time));
@@ -1762,6 +3002,9 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
         ok = consume_statement_end(&p);
         if (ok) print_active_sessions();
     } else if (!strcmp(command, "KILL")) {
+        if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            return report_database_error("permission denied: KILL SESSION requires the ADMIN role");
+        }
         consume_keyword(&p, "SESSION");
         if (p.kind != TK_NUMBER) {
             ok = report_database_error("expected session ID number after KILL");
@@ -1771,6 +3014,9 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             ok = consume_statement_end(&p) && kill_client_session(sid);
         }
     } else if (!strcmp(command, "RESTART")) {
+        if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            return report_database_error("permission denied: RESTART requires the ADMIN role");
+        }
         ok = consume_statement_end(&p) && request_server_restart();
         if (ok) shell_puts("Hot-patch restart initiated; the successor process is taking over.");
     } else if (!strcmp(command, "SHOW") && consume_keyword(&p, "DATABASES")) {
@@ -1829,8 +3075,12 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
         if (!consume_statement_end(&p) || g_pending) ok = false;
         else { g_pending = true; shell_puts("Transaction started."); }
     } else if (!strcmp(command, "BACKUP")) {
-        ok = consume_statement_end(&p);
-        if (ok) { ok = backup_committed_snapshot(); if (ok) shell_puts("Backup complete (committed data only)."); }
+        if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            ok = report_database_error("permission denied: BACKUP requires the ADMIN role");
+        } else {
+            ok = consume_statement_end(&p);
+            if (ok) { ok = backup_committed_snapshot(); if (ok) shell_puts("Backup complete (committed data only)."); }
+        }
     } else if (!strcmp(command, "CHECK")) {
         if (consume_keyword(&p, "INTEGRITY") && consume_statement_end(&p)) {
             ok = execute_check_integrity();
@@ -1838,6 +3088,8 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
     } else if (!strcmp(command, "VERIFY")) {
         if (!consume_keyword(&p, "BACKUP")) {
             ok = report_database_error("expected VERIFY BACKUP '<file>'");
+        } else if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            ok = report_database_error("permission denied: VERIFY BACKUP requires the ADMIN role");
         } else {
             char verify_path[PATH_CAP] = {0};
             if (!parse_path_arg(&p, verify_path, sizeof(verify_path)) || !consume_statement_end(&p)) {
@@ -1876,12 +3128,16 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
                 snprintf(dump_path, sizeof(dump_path), "%s", p.text);
                 scan_next_token(&p);
             }
-            if (!consume_statement_end(&p)) ok = false;
+            if (dump_path[0] && g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+                ok = report_database_error("permission denied: DUMP DATABASE TO requires the ADMIN role");
+            } else if (!consume_statement_end(&p)) ok = false;
             else ok = dump_database_sql(g_db, dump_path[0] ? dump_path : NULL);
         }
     } else if (!strcmp(command, "DIFF")) {
         if (!consume_keyword(&p, "SCHEMA") || p.kind != TK_STRING) {
             ok = report_database_error("expected SCHEMA '<other_db>' after DIFF");
+        } else if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            ok = report_database_error("permission denied: DIFF SCHEMA requires the ADMIN role");
         } else {
             char other_path[PATH_CAP];
             snprintf(other_path, sizeof(other_path), "%s", p.text);
@@ -1890,7 +3146,9 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             else ok = diff_database_schema(g_db, other_path);
         }
     } else if (!strcmp(command, "BENCHMARK")) {
-        if (p.kind != TK_NUMBER) {
+        if (g_network_user[0] && g_network_user_role != USER_ROLE_ADMIN) {
+            ok = report_database_error("permission denied: BENCHMARK requires the ADMIN role");
+        } else if (p.kind != TK_NUMBER) {
             ok = report_database_error("expected iteration count after BENCHMARK");
         } else {
             int iters = (int)strtol(p.text, NULL, 10);
@@ -1929,12 +3187,17 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
             }
         }
     } else if (!strcmp(command, "WATCH")) {
+        if (g_network_user[0]) {
+            return report_database_error("WATCH is disabled for network sessions");
+        }
         int interval_s = 0;
         int watch_count = 1;
         for (;;) {
             if (consume_keyword(&p, "INTERVAL")) {
                 if (p.kind != TK_NUMBER) return report_database_error("expected seconds after INTERVAL");
                 interval_s = (int)strtol(p.text, NULL, 10);
+                if (interval_s < 0) interval_s = 0;
+                if (interval_s > 3600) interval_s = 3600;
                 scan_next_token(&p);
             } else if (consume_keyword(&p, "COUNT")) {
                 if (p.kind != TK_NUMBER) return report_database_error("expected iteration count after COUNT");
@@ -2120,8 +3383,73 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
                         col->ref_table, col->ref_table[0] ? "." : "", col->ref_column);
             }
         }
-    } else if (!strcmp(command, "EXPLAIN")) ok = explain_statement(&p);
-    else if (!strcmp(command, "SELECT")) ok = execute_select_query(&p);
+    } else if (!strcmp(command, "EXPLAIN")) {
+        ok = explain_statement(&p);
+    } else if (!strcmp(command, "DRYRUN") || !strcmp(command, "DRY_RUN") || !strcmp(command, "TEST")) {
+        char subcmd[MAX_NAME_LEN] = {0};
+        if (!parse_identifier(&p, subcmd)) {
+            return report_database_error("expected statement after %s (e.g. %s DROP TABLE tablename;)", command, command);
+        }
+        char target[MAX_NAME_LEN] = {0};
+        char action[MAX_NAME_LEN] = {0};
+        char extra[256] = {0};
+        if (!strcmp(subcmd, "DROP")) {
+            if (consume_keyword(&p, "TABLE")) {
+                consume_keyword(&p, "IF");
+                consume_keyword(&p, "EXISTS");
+                parse_identifier(&p, target);
+                snprintf(action, sizeof(action), "DROP TABLE");
+            } else if (consume_keyword(&p, "DATABASE")) {
+                parse_path_arg(&p, target, sizeof(target));
+                snprintf(action, sizeof(action), "DROP DATABASE");
+            } else if (consume_keyword(&p, "USER")) {
+                if (p.kind == TK_STRING || p.kind == TK_ID) {
+                    snprintf(target, sizeof(target), "%s", p.text);
+                    scan_next_token(&p);
+                }
+                snprintf(action, sizeof(action), "DROP USER");
+            } else if (consume_keyword(&p, "INDEX")) {
+                parse_identifier(&p, target);
+                snprintf(action, sizeof(action), "DROP INDEX");
+            }
+        } else if (!strcmp(subcmd, "TRUNCATE")) {
+            consume_keyword(&p, "TABLE");
+            parse_identifier(&p, target);
+            snprintf(action, sizeof(action), "TRUNCATE TABLE");
+        } else if (!strcmp(subcmd, "DELETE")) {
+            consume_keyword(&p, "FROM");
+            parse_identifier(&p, target);
+            snprintf(action, sizeof(action), "DELETE FROM");
+            bool has_where = false;
+            while (p.kind != TK_END && p.kind != TK_SEMI && !p.failed) {
+                if (token_is_keyword(&p, "WHERE")) { has_where = true; break; }
+                scan_next_token(&p);
+            }
+            if (!has_where) snprintf(extra, sizeof(extra), "UNCONDITIONAL (no WHERE clause)");
+            else snprintf(extra, sizeof(extra), "Filtered with WHERE condition");
+        } else if (!strcmp(subcmd, "UPDATE")) {
+            parse_identifier(&p, target);
+            snprintf(action, sizeof(action), "UPDATE");
+            bool has_where = false;
+            while (p.kind != TK_END && p.kind != TK_SEMI && !p.failed) {
+                if (token_is_keyword(&p, "WHERE")) { has_where = true; break; }
+                scan_next_token(&p);
+            }
+            if (!has_where) snprintf(extra, sizeof(extra), "UNCONDITIONAL (no WHERE clause)");
+            else snprintf(extra, sizeof(extra), "Filtered with WHERE condition");
+        } else if (!strcmp(subcmd, "ALTER")) {
+            if (consume_keyword(&p, "TABLE")) {
+                parse_identifier(&p, target);
+                snprintf(action, sizeof(action), "ALTER TABLE");
+                snprintf(extra, sizeof(extra), "Table schema modification");
+            }
+        } else {
+            snprintf(action, sizeof(action), "%s", subcmd);
+            parse_identifier(&p, target);
+        }
+        show_destructive_dry_run(action[0] ? action : subcmd, target, extra);
+        ok = true;
+    } else if (!strcmp(command, "SELECT")) ok = execute_select_query(&p);
     else if (!strcmp(command, "WITH")) ok = execute_with_query(&p);
     else if (!strcmp(command, "ANALYZE")) {
         char tbl_name[MAX_NAME_LEN] = {0};
@@ -2145,6 +3473,24 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
         ok = consume_keyword(&p, "SAMPLE") && consume_statement_end(&p) && load_sample_data();
     } else if ((!strcmp(command, "DROP") || !strcmp(command, "ALTER")) &&
                token_is_keyword(&p, "USER")) {
+        if (!strcmp(command, "DROP")) {
+            Parser probe = p;
+            consume_keyword(&probe, "USER");
+            char user_name[MAX_NAME_LEN] = {0};
+            if (probe.kind == TK_STRING || probe.kind == TK_ID) {
+                snprintf(user_name, sizeof(user_name), "%s", probe.text);
+                scan_next_token(&probe);
+            }
+            ConfirmationResult confirmation = confirm_destructive_action(
+                "DROP USER", user_name, "This permanently deletes the user account and revokes credentials.", "DROP");
+            if (confirmation == CONFIRM_DRYRUN) {
+                handle_confirmation_with_dryrun(&confirmation, "DROP USER", user_name, "Active sessions and roles for this user will be invalidated.");
+            }
+            if (!allow_or_report_confirmation(confirmation)) {
+                if (confirmation == CONFIRM_CANCEL) return true;
+                return false;
+            }
+        }
         ok = execute_user_catalog_statement(&p, command);
     } else if (!strcmp(command, "DROP") || !strcmp(command, "INSERT") ||
              !strcmp(command, "UPDATE") || !strcmp(command, "DELETE") || !strcmp(command, "ALTER") ||
@@ -2152,25 +3498,50 @@ static bool execute_console_statement_impl(const char* text, bool* quit) {
         Parser probe = p;
         const char* explanation = NULL;
         const char* expected = NULL;
+        const char* action_desc = command;
         char table_name[MAX_NAME_LEN] = {0};
-        if (!strcmp(command, "DROP") && consume_keyword(&probe, "TABLE") &&
-            parse_identifier(&probe, table_name)) {
-            explanation = "This permanently removes the table and all of its rows.";
-            expected = "DROP";
+        char extra_detail[256] = {0};
+        if (!strcmp(command, "DROP") && consume_keyword(&probe, "TABLE")) {
+            consume_keyword(&probe, "IF");
+            consume_keyword(&probe, "EXISTS");
+            if (parse_identifier(&probe, table_name)) {
+                explanation = "This permanently removes the table and all of its rows.";
+                expected = "DROP";
+                action_desc = "DROP TABLE";
+            }
         } else if (!strcmp(command, "TRUNCATE")) {
             consume_keyword(&probe, "TABLE");
             if (parse_identifier(&probe, table_name)) {
-                explanation = "This removes every row from the table.";
+                explanation = "This removes every row from the table while preserving schema.";
                 expected = "TRUNCATE";
+                action_desc = "TRUNCATE TABLE";
             }
         } else if (!strcmp(command, "DELETE") && consume_keyword(&probe, "FROM") &&
-                   parse_identifier(&probe, table_name) &&
-                   (probe.kind == TK_SEMI || probe.kind == TK_END)) {
-            explanation = "This deletes every row from the table.";
-            expected = "DELETE";
+                   parse_identifier(&probe, table_name)) {
+            if (probe.kind == TK_SEMI || probe.kind == TK_END) {
+                explanation = "Unconditional DELETE: every row in this table will be deleted!";
+                expected = "DELETE";
+                action_desc = "DELETE FROM";
+                snprintf(extra_detail, sizeof(extra_detail), "UNCONDITIONAL (no WHERE clause)");
+            }
+        } else if (!strcmp(command, "UPDATE") && parse_identifier(&probe, table_name)) {
+            bool has_where = false;
+            while (probe.kind != TK_END && probe.kind != TK_SEMI && !probe.failed) {
+                if (token_is_keyword(&probe, "WHERE")) { has_where = true; break; }
+                scan_next_token(&probe);
+            }
+            if (!has_where) {
+                explanation = "Unconditional UPDATE: every row in this table will be modified!";
+                expected = "UPDATE";
+                action_desc = "UPDATE";
+                snprintf(extra_detail, sizeof(extra_detail), "UNCONDITIONAL (no WHERE clause)");
+            }
         }
         if (expected) {
-            ConfirmationResult confirmation = confirm_destructive_action(explanation, expected);
+            ConfirmationResult confirmation = confirm_destructive_action(action_desc, table_name, explanation, expected);
+            if (confirmation == CONFIRM_DRYRUN) {
+                handle_confirmation_with_dryrun(&confirmation, action_desc, table_name, extra_detail);
+            }
             if (!allow_or_report_confirmation(confirmation)) {
                 if (confirmation == CONFIRM_CANCEL) return true;
                 return false;
