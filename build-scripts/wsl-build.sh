@@ -21,7 +21,7 @@ fi
 
 mkdir -p bin
 
-CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Werror -O2 -g -pthread"
+CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Werror -O2 -g -pthread -Isrc -Iinclude"
 LIBS="-lcrypto -lldap -llber -lm"
 if [[ "${OPENDATA_TLS:-0}" == "1" ]]; then
     CFLAGS="$CFLAGS -DOPENDATA_TLS"

@@ -158,8 +158,9 @@ static bool authenticate_ad_user(const char* username, const char* password, Use
     int version = LDAP_VERSION3;
     ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &version);
     struct timeval tv = { 3, 0 };
+    int timelimit = 3;
     ldap_set_option(ld, LDAP_OPT_NETWORK_TIMEOUT, &tv);
-    ldap_set_option(ld, LDAP_OPT_TIMELIMIT, &tv);
+    ldap_set_option(ld, LDAP_OPT_TIMELIMIT, &timelimit);
 
     struct berval cred;
     cred.bv_val = (char*)password;
@@ -243,8 +244,9 @@ static bool authenticate_ldap_user(const char* username, const char* password, U
     int version = LDAP_VERSION3;
     ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &version);
     struct timeval tv = { 3, 0 };
+    int timelimit = 3;
     ldap_set_option(ld, LDAP_OPT_NETWORK_TIMEOUT, &tv);
-    ldap_set_option(ld, LDAP_OPT_TIMELIMIT, &tv);
+    ldap_set_option(ld, LDAP_OPT_TIMELIMIT, &timelimit);
 
     struct berval cred;
     cred.bv_val = (char*)password;
