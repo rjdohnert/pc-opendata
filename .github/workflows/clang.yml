@@ -20,6 +20,10 @@ jobs:
         run: |
           .\bin\opendata.exe --help
           .\bin\opendata.exe --version
+      - name: Package Windows installer
+        shell: powershell
+        run: |
+          Compress-Archive -Path .\bin\opendata.exe, .\installer\install.bat, .\installer\install.ps1, .\installer\install-elevate.ps1, .\installer\README.txt -DestinationPath .\installer\OpenDataSQL-Setup.zip -Force
       - name: Generate SHA-256 checksums
         shell: powershell
         run: |
